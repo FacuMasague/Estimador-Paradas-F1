@@ -1,0 +1,33 @@
+# Archivos generados por Python.
+__pycache__/
+*.py[cod]
+
+# Entornos virtuales locales.
+.venv/
+venv/
+env/
+
+# Configuración local y posibles credenciales.
+.env
+.env.*
+!.env.example
+
+# Bases locales descargadas: cada integrante puede generarlas con el programa.
+*.sqlite
+*.sqlite3
+*.db
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Archivos de macOS y herramientas de pruebas.
+.DS_Store
+.pytest_cache/
+.coverage
+htmlcov/
