@@ -28,6 +28,13 @@ env/
 
 # Archivos de macOS y herramientas de pruebas.
 .DS_Store
+.vscode/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Archivos de sesión de RStudio; el código R sí se podrá versionar.
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
