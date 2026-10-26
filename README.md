@@ -4,7 +4,8 @@ Proyecto universitario de Metodología del Aprendizaje. **Python solo descarga y
 actualiza una base SQLite. El análisis y las estrategias se desarrollarán en R
 con RStudio.** No hay interfaz de selección de piloto ni modelo de ritmo en Python.
 
-Todo el código de funcionamiento está en `estimadorF1.py`. La base se llama
+El actualizador está en `estimadorF1.py`; el análisis se desarrolla en
+`estimadorR.R`. La base se llama
 `datosOpenF1.sqlite3` y queda junto al script, independientemente de la carpeta
 desde donde se lo ejecute. OpenF1 histórico no necesita API key ni suscripción.
 
@@ -220,7 +221,25 @@ ORDER BY endpoint, parametros_json;
 ```
 
 Abrir SQLite desde R en modo lectura una vez completado el lote de actualización.
-No se creó un programa R: esa parte se desarrollará paso a paso con el autor.
+Abrir el proyecto de RStudio y ejecutar `estimadorR.R` con **Source**. Los menús
+permiten elegir temporada, GP y piloto; con `Rscript` se omiten los menús.
+
+El análisis revisa las tres prácticas del GP elegido y conserva un resumen por
+sesión. Solo las prácticas con tramos meteorológicos candidatos aportan vueltas.
+Las descargas ausentes, fallidas o con cantidades inconsistentes quedan señaladas
+sin impedir la revisión de las otras prácticas. `revisionPiloto` contiene el
+resumen y los registros; `vueltasEnTramo` conserva las vueltas cuyo inicio y final
+calculado están dentro del tramo. `vueltasConStint` además exige una única
+coincidencia de stint y un número de vuelta no repetido en esa sesión y piloto.
+
+Estos conjuntos todavía requieren limpieza de boxes y neutralizaciones; no son
+vueltas listas para ajustar el modelo. OpenF1 describe `date_start` como aproximado:
+el final se calcula sumando `lap_duration` en segundos y también es aproximado.
+Los límites `lap_start` y `lap_end` se comparan inclusivamente; una vuelta que
+coincide con dos stints se marca como ambigua y no recibe compuesto automático.
+Se conservan los números originales y la edad inicial informada, sin calcular
+todavía la edad por vuelta ni mezclar ritmos de distintas prácticas.
+Referencia: [documentación de OpenF1](https://openf1.org/docs/).
 
 ## Migración de la base anterior
 
@@ -238,6 +257,7 @@ rechaza para evitar una migración equivocada.
 
 ```bash
 python -m unittest -v test_catalogo
+Rscript test_practicas.R
 ```
 
 Las pruebas usan registros sintéticos y bases temporales/en memoria. Comprueban
@@ -247,13 +267,18 @@ La salida del programa es 0 al completar sin errores registrados, 1 ante errores
 o solicitudes no disponibles, y 130 si se interrumpe con Ctrl+C. Vacíos identificados
 no se confunden con errores; consultar siempre los estados y la cobertura desde R.
 
+Las pruebas de R usan vueltas sintéticas y una base SQLite temporal. Comprueban
+el cruce de límites horarios, las asignaciones ambiguas, los duplicados y la
+continuación entre prácticas cuando faltan datos. No requieren la base histórica.
+
 `estimadorF1chat.py`, `casos_sinteticos.json`, `test_estimadorF1.py` y
 `notas_diseno_anteriores.md` se conservan como antecedentes y no intervienen en la
 actualización. Las notas antiguas no definen el alcance vigente.
 
 ## GitHub y alcance de fuentes
 
-Subir `estimadorF1.py`, `requirements.txt`, `README.md`, `test_catalogo.py` y
+Subir `estimadorF1.py`, `estimadorR.R`, el proyecto `.Rproj`, `requirements.txt`,
+`README.md`, `test_catalogo.py`, `test_practicas.R` y
 `.gitignore`. Las bases, respaldos, entornos y configuración local del editor
 quedan fuera de Git. Cada integrante genera su base con el mismo script.
 
