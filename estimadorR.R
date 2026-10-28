@@ -183,7 +183,7 @@ evaluarLluvia <- function(lluviaPreparada, inicio, fin, maxHuecoSegundos = 120) 
       if (t[j] > b) {
         if (r[j] %in% 0 && t[j] - ultimoSeco <= maxHuecoSegundos) {
           return(resultado("candidato_completo",
-                           "sin_lluvia_observada_con_cobertura",
+ "sin_lluvia_observada_con_cobertura",
                            b))
         }
         
@@ -478,7 +478,7 @@ seleccionarAnalisis <- function(gpDisponibles, revisionClima, rutaBase,
 
 # Anotar las vueltas originales sin borrar registros ni renumerar su uso.
 # date_start es aproximado segun OpenF1. El final calculado tambien lo es.
-# lap_duration se expresa en segundos. No se calcula todavia la edad por vuelta.
+# lap_duration se expresa en segundos. edad_inicio se expresa en vueltas completadas.
 anotarVueltasPiloto <- function(vueltas, stints, inicio, fin) {
   vueltas$inicioUTC <- as.POSIXct(
     vueltas$date_start, format = "%Y-%m-%dT%H:%M:%OS", tz = "UTC"
@@ -546,6 +546,251 @@ anotarVueltasPiloto <- function(vueltas, stints, inicio, fin) {
     }
   }
 
+  # Edad al INICIO de la vuelta: vueltas completadas por ese juego antes de esta.
+  # Se calcula con el numero original de vuelta, no con las vueltas que sobreviven
+  # a la limpieza: una vuelta descartada igual consumio uso del neumatico.
+  # Sin stint unico asignado o sin edad inicial conocida queda NA.
+  vueltas$edad_inicio <- vueltas$tyre_age_at_start +
+    (vueltas$lap_number - vueltas$lap_start_stint)
+
+  return(vueltas)
+}
+
+# Convertir fechas ISO de OpenF1 (UTC) a POSIXct, como en el resto del script.
+aFechaUTC <- function(x) {
+  as.POSIXct(x, format = "%Y-%m-%dT%H:%M:%OS", tz = "UTC")
+}
+
+# Tabla de intervalos sin filas, con las mismas columnas que armarIntervalosControl().
+intervalosVacios <- function() {
+  sinFecha <- as.POSIXct(character(), tz = "UTC")
+  data.frame(tipo = character(), desde = sinFecha, hasta = sinFecha,
+             cerrado = logical())
+}
+
+# Construir intervalos de neutralizacion de UNA sesion a partir de race_control.
+# Los mensajes son instantes: el intervalo va desde el mensaje que lo abre hasta el
+# primer mensaje posterior que lo cierra. Sin cierre se extiende hasta finTramo y
+# queda cerrado = FALSE, para no suponer que la situacion termino.
+# Tipos: amarilla (solo informativa), bandera_roja y vsc_sc.
+# El campo sector de race_control es un sector de comisarios, no uno de los tres
+# sectores de cronometraje: por eso no se cruza con duration_sector_1..3.
+armarIntervalosControl <- function(control, finTramo) {
+  if (nrow(control) == 0) return(intervalosVacios())
+
+  fecha <- aFechaUTC(control$date)
+  orden <- order(fecha)
+  control <- control[orden, ]
+  fecha <- fecha[orden]
+  bandera <- ifelse(is.na(control$flag), "", control$flag)
+  mensaje <- toupper(ifelse(is.na(control$message), "", control$message))
+  pista <- control$scope %in% "Track"
+
+  filas <- list()
+  for (i in seq_len(nrow(control))) {
+    if (bandera[i] %in% c("YELLOW", "DOUBLE YELLOW")) {
+      tipo <- "amarilla"
+      # La cierra un CLEAR del mismo sector de comisarios o de toda la pista.
+      cierra <- (bandera == "CLEAR" &
+                   (control$sector %in% control$sector[i] | pista)) |
+        bandera %in% c("RED", "CHEQUERED")
+    } else if (bandera[i] == "RED" || mensaje[i] == "SESSION ABORTED") {
+      tipo <- "bandera_roja"
+      # La sesion se reanuda con la luz verde de salida de boxes.
+      cierra <- (bandera == "GREEN" & pista) | mensaje == "SESSION STARTED" |
+        bandera == "CHEQUERED"
+    } else if (grepl("SAFETY CAR DEPLOYED|VSC DEPLOYED", mensaje[i])) {
+      tipo <- "vsc_sc"
+      cierra <- grepl("ENDING|IN THIS LAP", mensaje) |
+        bandera %in% c("RED", "CHEQUERED")
+    } else {
+      next
+    }
+
+    siguiente <- which(seq_along(cierra) > i & cierra)[1]
+    filas[[length(filas) + 1]] <- data.frame(
+      tipo = tipo,
+      desde = fecha[i],
+      hasta = if (is.na(siguiente)) finTramo else fecha[siguiente],
+      cerrado = !is.na(siguiente)
+    )
+  }
+
+  if (length(filas) == 0) return(intervalosVacios())
+  return(do.call(rbind, filas))
+}
+
+# Marcar vueltas identificables como no representativas, sin borrar registros.
+# vueltas: vueltas de UNA sesion, ya anotadas por anotarVueltasPiloto().
+# intervalos: salida de armarIntervalosControl() para esa misma sesion.
+# controlVerificado: FALSE si la descarga de race_control no pudo comprobarse;
+# en ese caso no se puede afirmar que no hubo neutralizaciones.
+# Una vuelta marcada igual consumio uso del neumatico: no recalcula edades.
+# candidata_ajuste NO significa vuelta limpia: faltan los residuos atipicos.
+marcarVueltasNoRepresentativas <- function(vueltas, intervalos, controlVerificado) {
+  n <- nrow(vueltas)
+  vueltas$salida_boxes <- vueltas$is_pit_out_lap %in% 1
+  vueltas$salida_boxes_desconocida <- is.na(vueltas$is_pit_out_lap)
+
+  # Entrada a boxes INFERIDA: OpenF1 no trae un campo de entrada.
+  # Se supone que la vuelta n termina en boxes si la n+1 del mismo piloto y
+  # sesion es una vuelta de salida.
+  vueltas$entrada_boxes_inferida <- rep(FALSE, n)
+  for (i in seq_len(n)) {
+    if (!is.finite(vueltas$lap_number[i])) next
+    siguiente <- which(
+      vueltas$session_key %in% vueltas$session_key[i] &
+        vueltas$driver_number %in% vueltas$driver_number[i] &
+        vueltas$lap_number %in% (vueltas$lap_number[i] + 1)
+    )
+    vueltas$entrada_boxes_inferida[i] <- any(vueltas$is_pit_out_lap[siguiente] %in% 1)
+  }
+
+  vueltas$duracion_invalida <- !(is.finite(vueltas$lap_duration) &
+                                   vueltas$lap_duration > 0)
+
+  # Una vuelta se considera afectada si se superpone con el intervalo,
+  # aunque sea por un instante.
+  conHorario <- !is.na(vueltas$inicioUTC) & !is.na(vueltas$finUTC)
+  for (tipo in c("amarilla", "bandera_roja", "vsc_sc")) {
+    vueltas[[tipo]] <- rep(FALSE, n)
+  }
+  for (k in seq_len(nrow(intervalos))) {
+    toca <- conHorario & vueltas$inicioUTC <= intervalos$hasta[k] &
+      vueltas$finUTC >= intervalos$desde[k]
+    vueltas[[intervalos$tipo[k]]] <- vueltas[[intervalos$tipo[k]]] | (toca %in% TRUE)
+  }
+  # La amarilla es solo informativa: su efecto real lo detectan los residuos.
+  names(vueltas)[names(vueltas) == "amarilla"] <- "con_amarilla"
+  vueltas$control_no_verificable <- rep(!isTRUE(controlVerificado), n)
+
+  # Una vuelta puede tener varios motivos, separados por punto y coma.
+  motivos <- c("salida_boxes", "salida_boxes_desconocida", "entrada_boxes_inferida",
+               "duracion_invalida", "bandera_roja", "vsc_sc",
+               "control_no_verificable")
+  vueltas$motivos_exclusion <- rep("", n)
+  for (motivo in motivos) {
+    m <- vueltas[[motivo]]
+    vueltas$motivos_exclusion[m] <- ifelse(
+      vueltas$motivos_exclusion[m] == "", motivo,
+      paste(vueltas$motivos_exclusion[m], motivo, sep = ";")
+    )
+  }
+
+  vueltas$candidata_ajuste <- vueltas$estado_horario == "dentro_del_tramo" &
+    vueltas$estado_stint == "asignado" & !vueltas$numero_repetido &
+    vueltas$motivos_exclusion == ""
+  return(vueltas)
+}
+
+# Ajuste lineal robusto de Theil-Sen: tiempo = base + pendiente * edad.
+# La pendiente es la mediana de las pendientes entre todos los pares de vueltas con
+# edades distintas; la base es la mediana de (tiempo - pendiente * edad).
+# A diferencia de lm(), una vuelta muy lenta no arrastra la recta: tolera hasta
+# cerca de un 29 % de valores atipicos. Se usa solo para el ajuste PRELIMINAR
+# que detecta residuos; no es el modelo final por compuesto.
+# Unidades: tiempo en segundos, edad en vueltas, pendiente en segundos por vuelta.
+ajustarTheilSen <- function(edad, tiempo) {
+  pares <- combn(seq_along(edad), 2)
+  i <- pares[1, ]
+  j <- pares[2, ]
+  distintas <- edad[i] != edad[j]
+  if (!any(distintas)) stop("Se necesitan al menos dos edades distintas.")
+  pendiente <- median((tiempo[j] - tiempo[i])[distintas] /
+                        (edad[j] - edad[i])[distintas])
+  base <- median(tiempo - pendiente * edad)
+  list(base = base, pendiente = pendiente)
+}
+
+# Marcar residuos atipicos, lentos y rapidos, sin borrar registros.
+# vueltas: vueltas del piloto en las TRES practicas, con candidata_ajuste y edad_inicio.
+# Centro: ajuste preliminar robusto por stint (Theil-Sen, tiempo ~ edad). Escala: MAD escalada de
+# los residuos de la practica; si no alcanza, de las tres practicas del piloto;
+# si tampoco alcanza, no se evalua automaticamente.
+# minVueltasStint, minResiduos y umbral son supuestos configurables, no validados.
+# Que una vuelta no sea atipica no garantiza que no la afecto una amarilla leve.
+marcarResiduosAtipicos <- function(vueltas, minVueltasStint = 4, minResiduos = 15,
+                                   umbral = 3) {
+  n <- nrow(vueltas)
+  vueltas$residuo <- rep(NA_real_, n)
+  vueltas$estado_residuo <- ifelse(vueltas$candidata_ajuste %in% TRUE,
+                                   "pendiente", "no_candidata")
+  vueltas$origen_escala <- rep(NA_character_, n)
+  vueltas$residuo_lento <- rep(FALSE, n)
+  vueltas$residuo_rapido <- rep(FALSE, n)
+
+  # 1. Ajuste preliminar por stint. stint_number solo no identifica una tanda:
+  #    la clave incluye sesion y piloto.
+  candidatas <- vueltas$candidata_ajuste %in% TRUE
+  clave <- paste(vueltas$session_key, vueltas$driver_number, vueltas$stint_number)
+  for (k in unique(clave[candidatas])) {
+    filas <- which(clave == k & candidatas)
+    if (any(!is.finite(vueltas$edad_inicio[filas]))) {
+      vueltas$estado_residuo[filas] <- "edad_desconocida"
+      next
+    }
+    # Con pocas vueltas la recta queda forzada por los puntos y el residuo no
+    # informa. Esto tambien deja afuera las simulaciones de clasificacion.
+    if (length(filas) < minVueltasStint ||
+        length(unique(vueltas$edad_inicio[filas])) < 2) {
+      vueltas$estado_residuo[filas] <- "stint_corto"
+      next
+    }
+    ajuste <- ajustarTheilSen(vueltas$edad_inicio[filas], vueltas$lap_duration[filas])
+    vueltas$residuo[filas] <- vueltas$lap_duration[filas] -
+      (ajuste$base + ajuste$pendiente * vueltas$edad_inicio[filas])
+  }
+
+  # 2. Escala robusta. Devuelve NULL con pocos residuos o con MAD = 0.
+  # Los tiempos tienen resolucion de 0,001 s: una escala menor se trata como 0,
+  # porque los residuos de un ajuste exacto no dan 0 exacto por redondeo numerico.
+  conResiduo <- !is.na(vueltas$residuo)
+  calcularEscala <- function(filas) {
+    r <- vueltas$residuo[filas]
+    if (length(r) < minResiduos) return(NULL)
+    escala <- 1.4826 * median(abs(r - median(r)))
+    if (!is.finite(escala) || escala < 0.001) return(NULL)
+    list(centro = median(r), escala = escala)
+  }
+  respaldo <- calcularEscala(which(conResiduo))
+
+  # 3. Evaluar cada practica con su escala o, si falta, con la de respaldo.
+  for (sesion in unique(vueltas$session_key[conResiduo])) {
+    filas <- which(conResiduo & vueltas$session_key %in% sesion)
+    e <- calcularEscala(filas)
+    origen <- "practica"
+    if (is.null(e)) {
+      e <- respaldo
+      origen <- "tres_practicas"
+    }
+    if (is.null(e)) {
+      vueltas$estado_residuo[filas] <- "no_evaluada_pocos_residuos"
+      next
+    }
+    z <- (vueltas$residuo[filas] - e$centro) / e$escala
+    vueltas$residuo_lento[filas] <- z > umbral
+    vueltas$residuo_rapido[filas] <- z < -umbral
+    vueltas$estado_residuo[filas] <- "evaluada"
+    vueltas$origen_escala[filas] <- origen
+  }
+
+  # Apta para el ajuste: candidata, en un stint ajustable y no atipica.
+  # Las no evaluadas por falta de residuos se conservan, con advertencia en el resumen.
+  vueltas$apta_ajuste <- vueltas$estado_residuo %in%
+    c("evaluada", "no_evaluada_pocos_residuos") &
+    !vueltas$residuo_lento & !vueltas$residuo_rapido
+
+  # 4. Un stint que conserva menos de minVueltasStint vueltas aptas no sostiene
+  # una pendiente: por ejemplo, uno que alterna vueltas de empuje y de enfriamiento.
+  # Se excluye completo, pero conserva sus marcas de residuo para poder revisarlo.
+  for (k in unique(clave[vueltas$apta_ajuste])) {
+    filas <- which(clave == k & vueltas$estado_residuo %in%
+                     c("evaluada", "no_evaluada_pocos_residuos"))
+    if (sum(vueltas$apta_ajuste[filas]) < minVueltasStint) {
+      vueltas$estado_residuo[filas] <- "stint_insuficiente"
+      vueltas$apta_ajuste[filas] <- FALSE
+    }
+  }
   return(vueltas)
 }
 
@@ -569,15 +814,24 @@ revisarPracticasPiloto <- function(seleccion, revisionClima, rutaBase) {
   vueltasVacias <- dbGetQuery(conexion, "SELECT * FROM vueltas LIMIT 0")
   stintsVacios <- dbGetQuery(conexion, "SELECT * FROM stints LIMIT 0")
   sinFecha <- as.POSIXct(NA_real_, origin = "1970-01-01", tz = "UTC")
-  vueltasTodas <- anotarVueltasPiloto(vueltasVacias, stintsVacios, sinFecha, sinFecha)
+  # La tabla vacia pasa por las mismas funciones para que rbind encuentre las
+  # mismas columnas que en las sesiones revisadas.
+  vueltasTodas <- marcarVueltasNoRepresentativas(
+    anotarVueltasPiloto(vueltasVacias, stintsVacios, sinFecha, sinFecha),
+    intervalosVacios(), TRUE
+  )
   stintsTodos <- stintsVacios
 
   resumen <- practicas[, c("meeting_key", "session_key", "nombre", "estado", "motivo")]
   names(resumen)[4:5] <- c("estado_clima", "motivo_clima")
   resumen$estado_datos <- "no_revisado_por_clima"
+  resumen$control_verificado <- NA
   for (columna in c("vueltas_registradas", "stints_registrados", "vueltas_en_tramo",
                     "vueltas_con_stint_unico", "vueltas_stint_ambiguo",
-                    "vueltas_numero_repetido")) {
+                    "vueltas_numero_repetido", "neutralizaciones_sin_cierre",
+                    "vueltas_con_amarilla", "vueltas_candidatas_ajuste",
+                    "vueltas_stint_corto_o_insuficiente", "vueltas_atipicas",
+                    "vueltas_sin_evaluar_residuo", "vueltas_aptas_ajuste")) {
     resumen[[columna]] <- NA_integer_
   }
 
@@ -616,6 +870,36 @@ revisarPracticasPiloto <- function(seleccion, revisionClima, rutaBase) {
       vueltas, stints, practica$inicio_candidato, practica$fin_candidato
     )
 
+    # Control de carrera de la sesion COMPLETA: las banderas no tienen piloto.
+    # Si la descarga no puede comprobarse, la sesion se revisa igual y sus vueltas
+    # quedan marcadas como control_no_verificable.
+    control <- dbGetQuery(conexion,
+      "SELECT * FROM control_carrera WHERE session_key = ? ORDER BY date, registro",
+      params = parametros)
+    descargaControl <- dbGetQuery(conexion,
+      "SELECT estado, filas FROM descargas
+       WHERE endpoint = 'race_control'
+       AND json_extract(parametros_json, '$.session_key') = ?",
+      params = parametros)
+    # Toda practica tiene al menos el mensaje SESSION STARTED: una descarga
+    # vacia tampoco permite afirmar que no hubo neutralizaciones.
+    controlVerificado <- nrow(descargaControl) == 1 &&
+      isTRUE(descargaControl$estado[1] == "ok") &&
+      isTRUE(descargaControl$filas[1] == nrow(control)) &&
+      nrow(control) > 0 && !anyNA(aFechaUTC(control$date))
+    intervalos <- if (controlVerificado) {
+      armarIntervalosControl(control, practica$fin_candidato)
+    } else {
+      intervalosVacios()
+    }
+    vueltas <- marcarVueltasNoRepresentativas(vueltas, intervalos, controlVerificado)
+    resumen$control_verificado[i] <- controlVerificado
+    # Solo importan las que quedan abiertas dentro del tramo candidato.
+    resumen$neutralizaciones_sin_cierre[i] <- sum(
+      !intervalos$cerrado & intervalos$tipo != "amarilla" &
+        intervalos$desde <= practica$fin_candidato
+    )
+
     resumen$estado_datos[i] <- if (nrow(vueltas) == 0) {
       "sin_vueltas_del_piloto"
     } else if (nrow(stints) == 0) {
@@ -632,8 +916,25 @@ revisarPracticasPiloto <- function(seleccion, revisionClima, rutaBase) {
     )
     resumen$vueltas_stint_ambiguo[i] <- sum(dentro & vueltas$estado_stint == "ambiguo")
     resumen$vueltas_numero_repetido[i] <- sum(vueltas$numero_repetido)
+    resumen$vueltas_con_amarilla[i] <- sum(dentro & vueltas$con_amarilla)
+    resumen$vueltas_candidatas_ajuste[i] <- sum(vueltas$candidata_ajuste)
     vueltasTodas <- rbind(vueltasTodas, vueltas)
     stintsTodos <- rbind(stintsTodos, stints)
+  }
+
+  # Los residuos se evaluan con las tres practicas juntas, porque la escala de
+  # una practica con pocos residuos se toma de las tres practicas del piloto.
+  vueltasTodas <- marcarResiduosAtipicos(vueltasTodas)
+  for (i in which(!is.na(resumen$vueltas_candidatas_ajuste))) {
+    deSesion <- vueltasTodas$session_key %in% resumen$session_key[i]
+    estado <- vueltasTodas$estado_residuo[deSesion]
+    resumen$vueltas_stint_corto_o_insuficiente[i] <- sum(estado %in% c("stint_corto", "stint_insuficiente"))
+    resumen$vueltas_atipicas[i] <- sum(vueltasTodas$residuo_lento[deSesion] |
+                                         vueltasTodas$residuo_rapido[deSesion])
+    resumen$vueltas_sin_evaluar_residuo[i] <- sum(
+      estado %in% c("no_evaluada_pocos_residuos", "edad_desconocida")
+    )
+    resumen$vueltas_aptas_ajuste[i] <- sum(vueltasTodas$apta_ajuste[deSesion])
   }
 
   rownames(resumen) <- NULL
@@ -1219,5 +1520,15 @@ if (!is.null(seleccionUsuario)) {
   cat("Vueltas registradas del piloto:", nrow(vueltasPiloto), "\n")
   cat("Vueltas completas dentro de los tramos:", nrow(vueltasEnTramo), "\n")
   cat("Vueltas en tramo con stint unico y numero no repetido:", nrow(vueltasConStint), "\n")
-  cat("Estas vueltas todavia requieren limpieza de boxes y neutralizaciones.\n")
+
+  # Candidatas: sin boxes, bandera roja ni VSC/SC identificables.
+  # Aptas: ademas en un stint ajustable y sin residuo atipico.
+  # Ninguna de las dos garantiza vueltas limpias: son marcas del procedimiento acordado.
+  vueltasCandidatas <- vueltasPiloto[vueltasPiloto$candidata_ajuste, ]
+  vueltasAptas <- vueltasPiloto[vueltasPiloto$apta_ajuste, ]
+  cat("Vueltas candidatas tras exclusiones identificables:", nrow(vueltasCandidatas), "\n")
+  cat("Vueltas aptas para el ajuste preliminar:", nrow(vueltasAptas), "\n")
+  if (any(vueltasPiloto$estado_residuo == "no_evaluada_pocos_residuos")) {
+    cat("Advertencia: hay vueltas aptas sin evaluar sus residuos por falta de datos.\n")
+  }
 }
