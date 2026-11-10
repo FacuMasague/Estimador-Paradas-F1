@@ -1,0 +1,11 @@
+"temporada","gp","piloto","aire","cambios","vueltas_sumadas","faltan","real_estr","real_stints","opt_estr","opt_stints","real_s","sim_real_s","sim_real_esp_s","sim_opt_s","real_menos_sim","sim_menos_opt","margen","prob_real_mejor","mae_aj","desplaz","perdida_modelo","perdida_real","paradas"
+2024,"Bahrain Grand Prix","Max VERSTAPPEN",92,0,56,0,"SOFT-HARD-SOFT","17+20+20","HARD-MEDIUM","30+27",5407.5,5530.6,5531,5501,-123.1,30,58.8,0.295,0.38,-2.26,24.3,25.7,2
+2024,"Singapore Grand Prix","Lando NORRIS",88,0,61,0,"MEDIUM-HARD","30+32","HARD-SOFT","39+23",5952.1,5999.6,5999.8,5995.8,-47.4,4,46.2,0.46,0.84,-0.93,29.9,31.8,1
+2024,"Singapore Grand Prix","Max VERSTAPPEN",81,0,61,0,"MEDIUM-HARD","29+33","HARD-SOFT","39+23",5972.1,5999.2,5999.5,5996.1,-27.1,3.4,46.2,0.465,0.44,-0.47,29.9,32.7,1
+2024,"Las Vegas Grand Prix","George RUSSELL",93,0,49,0,"MEDIUM-HARD-HARD","12+20+18","MEDIUM-SOFT","21+29",4822.7,4878.1,4878.1,4853.1,-55.4,25,56.2,0.275,0.31,-1.09,23.6,21.9,2
+2023,"Spanish Grand Prix","Max VERSTAPPEN",85,0,65,0,"MEDIUM-HARD-SOFT","26+26+14","HARD-MEDIUM","35+31",5194,5268.5,5268.9,5256.8,-74.5,12.1,75.8,0.315,0.23,-1.14,22.9,22.8,2
+2024,"Hungarian Grand Prix","Oscar PIASTRI",94,1,69,0,"MEDIUM-HARD-MEDIUM","18+29+23","HARD-HARD-MEDIUM","23+24+23",5795.2,5882.2,5880,5877,-87,3,80.5,0.35,0.32,-1.29,21.4,21.5,2
+2024,"Dutch Grand Prix","Max VERSTAPPEN",90,1,71,0,"MEDIUM-HARD","27+45","HARD-MEDIUM","37+35",5388.5,5516.8,5518.3,5509.1,-128.3,9.2,82.2,0.29,0.23,-1.74,29.1,24,1
+2024,"Italian Grand Prix","Oscar PIASTRI",85,1,52,0,"MEDIUM-HARD-HARD","16+22+15","HARD-SOFT","27+26",4395.8,4475.5,4477.2,4471,-79.7,6.2,50.3,0.46,0.36,-1.59,25.3,25.9,2
+2025,"Abu Dhabi Grand Prix","Max VERSTAPPEN",91,0,57,0,"MEDIUM-HARD","23+35","HARD-MEDIUM","34+24",5075.8,5079.1,5080.4,5080.3,-3.3,0.1,58,0.46,0.22,-0.12,22.7,23.5,1
+2025,"Abu Dhabi Grand Prix","Oscar PIASTRI",78,0,57,0,"HARD-MEDIUM","41+17","HARD-MEDIUM","34+24",5087.2,5113.3,5114.5,5111.4,-26.1,3.1,58.3,0.37,0.21,-0.49,22.7,22.6,1

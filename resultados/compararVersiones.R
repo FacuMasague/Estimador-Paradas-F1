@@ -1,0 +1,17 @@
+a <- read.csv("resultados/investigacion_casos_v4_sin_vida.csv"); b <- read.csv("resultados/investigacion_casos.csv")
+prep <- function(x) { x$p_modelo <- ifelse(grepl("-", x$paradas_modelo), 2, 1); x$p_real <- ifelse(grepl("-", x$paradas_real), 2, 1); x$top10 <- !is.na(x$pos_previa) & x$pos_previa <= 10; x }
+a <- prep(a); b <- prep(b)
+res <- function(d, n) cat(sprintf("%-12s n=%3d | 2 paradas mod %2.0f%% real %2.0f%% | mismas paradas %2.0f%% | mismos comp %2.0f%% | real peor %5.1f | MAE %.2f | MAE aj %.2f | desplaz %+.2f | margen %5.1f | prob real %.2f\n", n, nrow(d), 100*mean(d$p_modelo==2), 100*mean(d$p_real==2), 100*mean(d$mismas_paradas), 100*mean(d$mismos_compuestos), median(d$real_peor_s), median(d$mae), median(d$mae_ajustado), median(d$desplazamiento), median(d$margen), median(d$prob_real_mejor)))
+res(a, "Anterior"); res(b, "Corregido"); res(b[b$top10,], "  top 10")
+comb <- function(x) sapply(strsplit(x, "-"), function(z) paste(sort(unique(z)), collapse = "+"))
+cat("\nRecomendados antes:\n"); print(sort(table(comb(a$modelo)), decreasing = TRUE))
+cat("Recomendados ahora:\n"); print(sort(table(comb(b$modelo)), decreasing = TRUE))
+cat("Reales:\n"); print(sort(table(comb(b$real)), decreasing = TRUE))
+l <- unlist(lapply(seq_len(nrow(b)), function(i) { c <- strsplit(b$modelo[i], "-")[[1]]; s <- as.numeric(strsplit(b$stints_modelo[i], "+", fixed = TRUE)[[1]]); s[c == "SOFT"] }))
+cat("Stints SOFT recomendados: n", length(l), "mediana", median(l), "\n")
+cat("Real en margen", round(100*mean(b$real_en_margen)), "% | combinaciones empatadas (mediana)", median(b$combinaciones_empatadas), "\n")
+for (g in unique(paste(b$temporada, b$gp))) { d <- b[paste(b$temporada, b$gp) == g, ]; cat(sprintf("%-26s n=%2d paradas %3.0f%% comp %3.0f%% real peor %5.1f MAE aj %.2f desp %+.2f\n", substr(g, 1, 26), nrow(d), 100*mean(d$mismas_paradas), 100*mean(d$mismos_compuestos), median(d$real_peor_s), median(d$mae_ajustado), median(d$desplazamiento))) }
+x <- read.csv("resultados/casos_limpios.csv"); y <- read.csv("resultados/casos_limpios_v4_sin_vida.csv")
+options(width = 200)
+print(x[, c("gp","piloto","real_estr","real_stints","opt_estr","opt_stints","real_s","sim_real_s","sim_opt_s","real_menos_sim","sim_menos_opt","margen","prob_real_mejor","mae_aj")], row.names = FALSE)
+cat("Limpios real-sim: antes", median(y$real_menos_sim), " ahora", median(x$real_menos_sim), "| por vuelta ahora", round(median(x$desplaz), 2), "\n")

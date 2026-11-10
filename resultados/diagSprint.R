@@ -1,0 +1,15 @@
+invisible(capture.output(source("estimadorR.R")))
+m <- grandesPremios$meeting_key[grandesPremios$temporada == 2025 & grepl("Qatar", grandesPremios$nombre)]
+print(m %in% gpConTramosCandidatos$meeting_key)
+print(table(revisionGP$estado[revisionGP$meeting_key == m]))
+pr <- sesiones[sesiones$meeting_key == m, c("nombre", "session_key", "presente_en_fuente", "fecha_inicio", "fecha_fin")]; print(pr)
+p <- sesiones[sesiones$meeting_key == m & sesiones$nombre %in% nombresPracticas, ]
+e <- revisarClimaPractica(p[1, ], climaCandidatas, descargasClima, maxHuecoSegundos = 120); print(e)
+print(table(revisionGP$estado))
+ex <- cbind(p[1, c("meeting_key","session_key","nombre")], e)
+print(names(revisionClima)); print(names(ex))
+r0 <- ex[c(1,1),]; r0$nombre <- c("Practice 2","Practice 3"); r0$session_key <- -(1:2); r0$estado <- "sin_sesion"; rc <- rbind(ex, r0)
+t <- rc[rc$estado %in% c("candidato_completo","candidato_parcial"),]; print(t)
+pil <- leerPilotosPracticas(rutaBase, t$session_key); print(nrow(pil))
+gp <- data.frame(meeting_key = m, temporada = 2025, nombre = "Qatar Grand Prix")
+print(try(str(campoGP(gp, pil$driver_number[1:3], t$session_key, rc, rutaBase, parametros)$degradacion)))

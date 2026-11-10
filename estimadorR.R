@@ -1,6 +1,9 @@
 library(DBI)
 library(RSQLite)
 
+# Formulas del modelo y de las estrategias, separadas de la lectura de datos y menus.
+source("modeloEstrategias.R")
+
 prepararLluvia <- function(clima) {
   # Comprobar las columnas que necesitan esta funcion.
   if (!all(c("fechaUTC", "rainfall") %in% names(clima))) {
@@ -430,8 +433,11 @@ leerPilotosPracticas <- function(rutaBase, clavesSesiones) {
 
 # Elegir temporada, GP y piloto sin descargar datos ni modificar SQLite.
 # Devolver las filas elegidas y los tramos candidatos para el analisis posterior.
+# filtrarPilotos: funcion opcional (gp, pilotos, tramos) que devuelve solo los pilotos
+# elegibles segun el modo; puede agregar la columna etiqueta_extra para el menu.
+# Si un GP no tiene pilotos elegibles, se vuelve a pedir el GP.
 seleccionarAnalisis <- function(gpDisponibles, revisionClima, rutaBase,
-                               leer = readline) {
+                               leer = readline, filtrarPilotos = NULL) {
   if (nrow(gpDisponibles) == 0) {
     cat("No hay Grandes Premios con tramos candidatos.\n")
     return(NULL)
@@ -448,23 +454,32 @@ seleccionarAnalisis <- function(gpDisponibles, revisionClima, rutaBase,
     opcionesGP$nombre, " (", opcionesGP$practicas_completas,
     " practicas completas, ", opcionesGP$practicas_parciales, " parciales)"
   )
-  opcion <- elegirOpcion("Selecciona el Gran Premio", etiquetasGP, leer)
-  if (opcion == 0) return(NULL)
-  gp <- opcionesGP[opcion, , drop = FALSE]
+  repeat {
+    opcion <- elegirOpcion("Selecciona el Gran Premio", etiquetasGP, leer)
+    if (opcion == 0) return(NULL)
+    gp <- opcionesGP[opcion, , drop = FALSE]
 
-  tramos <- revisionClima[
-    revisionClima$meeting_key %in% gp$meeting_key &
-      revisionClima$estado %in% c("candidato_completo", "candidato_parcial"),
-  ]
+    tramos <- revisionClima[
+      revisionClima$meeting_key %in% gp$meeting_key &
+        revisionClima$estado %in% c("candidato_completo", "candidato_parcial"),
+    ]
 
-  pilotos <- leerPilotosPracticas(rutaBase, tramos$session_key)
-  if (nrow(pilotos) == 0) {
-    cat("No hay pilotos disponibles con registros verificables en estas practicas.\n")
-    return(NULL)
+    pilotos <- leerPilotosPracticas(rutaBase, tramos$session_key)
+    if (!is.null(filtrarPilotos) && nrow(pilotos) > 0) {
+      cat("Comprobando las vueltas y compuestos de los pilotos de este GP...\n")
+      pilotos <- filtrarPilotos(gp, pilotos, tramos)
+    }
+    if (nrow(pilotos) > 0) break
+    cat("No hay pilotos elegibles en este Gran Premio. Elegi otro.\n")
   }
 
-  cat("\nLa lista de pilotos es preliminar: falta comprobar sus vueltas y compuestos.\n")
+  if (is.null(filtrarPilotos)) {
+    cat("\nLa lista de pilotos es preliminar: falta comprobar sus vueltas y compuestos.\n")
+  }
   etiquetasPilotos <- paste0(pilotos$full_name, " (dorsal ", pilotos$driver_number, ")")
+  if ("etiqueta_extra" %in% names(pilotos)) {
+    etiquetasPilotos <- paste(etiquetasPilotos, pilotos$etiqueta_extra)
+  }
   opcion <- elegirOpcion("Selecciona el piloto", etiquetasPilotos, leer)
   if (opcion == 0) return(NULL)
 
@@ -503,6 +518,7 @@ anotarVueltasPiloto <- function(vueltas, stints, inicio, fin) {
   vueltas$stint_number <- rep(NA_integer_, nrow(vueltas))
   vueltas$compound <- rep(NA_character_, nrow(vueltas))
   vueltas$lap_start_stint <- rep(NA_integer_, nrow(vueltas))
+  vueltas$lap_end_stint <- rep(NA_integer_, nrow(vueltas))
   vueltas$tyre_age_at_start <- rep(NA_integer_, nrow(vueltas))
 
   for (i in seq_len(nrow(vueltas))) {
@@ -542,6 +558,7 @@ anotarVueltasPiloto <- function(vueltas, stints, inicio, fin) {
       vueltas$stint_number[i] <- tanda$stint_number
       vueltas$compound[i] <- tanda$compound
       vueltas$lap_start_stint[i] <- tanda$lap_start
+      vueltas$lap_end_stint[i] <- tanda$lap_end
       vueltas$tyre_age_at_start[i] <- tanda$tyre_age_at_start
     }
   }
@@ -627,7 +644,13 @@ armarIntervalosControl <- function(control, finTramo) {
 # en ese caso no se puede afirmar que no hubo neutralizaciones.
 # Una vuelta marcada igual consumio uso del neumatico: no recalcula edades.
 # candidata_ajuste NO significa vuelta limpia: faltan los residuos atipicos.
-marcarVueltasNoRepresentativas <- function(vueltas, intervalos, controlVerificado) {
+# umbralVueltaLenta: una vuelta mas lenta que umbralVueltaLenta veces la vuelta mas
+# rapida del mismo piloto en la sesion (sin contar boxes) se marca vuelta_lenta.
+# Saca las vueltas de enfriamiento y las abortadas, que en practica pueden ser la
+# mitad de una tanda y rompen el ajuste robusto. 1.10 es un supuesto configurable:
+# una tanda larga con mucho combustible suele quedar dentro del 5-8 %.
+marcarVueltasNoRepresentativas <- function(vueltas, intervalos, controlVerificado,
+                                           umbralVueltaLenta = 1.10) {
   n <- nrow(vueltas)
   vueltas$salida_boxes <- vueltas$is_pit_out_lap %in% 1
   vueltas$salida_boxes_desconocida <- is.na(vueltas$is_pit_out_lap)
@@ -649,6 +672,17 @@ marcarVueltasNoRepresentativas <- function(vueltas, intervalos, controlVerificad
   vueltas$duracion_invalida <- !(is.finite(vueltas$lap_duration) &
                                    vueltas$lap_duration > 0)
 
+  # Referencia por sesion y piloto: su vuelta valida mas rapida fuera de boxes.
+  vueltas$vuelta_lenta <- rep(FALSE, n)
+  validas <- !vueltas$duracion_invalida & !vueltas$salida_boxes &
+    !vueltas$entrada_boxes_inferida
+  clave <- paste(vueltas$session_key, vueltas$driver_number)
+  for (k in unique(clave[validas])) {
+    referencia <- min(vueltas$lap_duration[clave == k & validas])
+    vueltas$vuelta_lenta[clave == k & validas] <-
+      vueltas$lap_duration[clave == k & validas] > umbralVueltaLenta * referencia
+  }
+
   # Una vuelta se considera afectada si se superpone con el intervalo,
   # aunque sea por un instante.
   conHorario <- !is.na(vueltas$inicioUTC) & !is.na(vueltas$finUTC)
@@ -666,7 +700,7 @@ marcarVueltasNoRepresentativas <- function(vueltas, intervalos, controlVerificad
 
   # Una vuelta puede tener varios motivos, separados por punto y coma.
   motivos <- c("salida_boxes", "salida_boxes_desconocida", "entrada_boxes_inferida",
-               "duracion_invalida", "bandera_roja", "vsc_sc",
+               "duracion_invalida", "vuelta_lenta", "bandera_roja", "vsc_sc",
                "control_no_verificable")
   vueltas$motivos_exclusion <- rep("", n)
   for (motivo in motivos) {
@@ -794,10 +828,67 @@ marcarResiduosAtipicos <- function(vueltas, minVueltasStint = 4, minResiduos = 1
   return(vueltas)
 }
 
+# Restar el efecto del combustible estimado a cada vuelta de practica.
+# La carga real de practica no se publica. Se estima la carga MINIMA que necesitaba
+# el auto: combustible para las vueltas que le faltaban al stint (contando la vuelta
+# de salida, la de entrada y la actual) mas un margen de margenVueltas vueltas.
+#   carga = consumoVuelta * (vueltas del stint - vueltas desde la salida) + consumo * margen
+#   tiempo_corregido = lap_duration - sensibilidad * carga
+# Asi tiempo_corregido es el tiempo con tanque casi vacio, y la carrera le vuelve a
+# sumar su propia carga (predecirVueltas). Supuesto declarado: los simulacros de
+# carrera que salen mas pesados de lo que usan quedan con una base algo lenta.
+# Simulacro de clasificacion: stint de SOFT con a lo sumo maxVueltasQualy vueltas;
+# sus vueltas consumen factorQualy veces el consumo de carrera.
+# combustible: lista de combustibleGP() con sensibilidad (s/kg), consumo (kg/vuelta
+# de carrera), factorQualy, maxVueltasQualy y margenVueltas.
+# Dentro de un stint la correccion suma sensibilidad * consumo a la pendiente y no
+# cambia los residuos ni las vueltas aptas.
+corregirCombustible <- function(vueltas, combustible) {
+  numeros <- unlist(combustible[c("sensibilidad", "consumo", "factorQualy",
+                                  "maxVueltasQualy", "margenVueltas")])
+  if (length(numeros) != 5 || any(!is.finite(numeros)) || any(numeros < 0)) {
+    stop("combustible debe tener sensibilidad, consumo, factorQualy, maxVueltasQualy ",
+         "y margenVueltas, todos numeros mayores o iguales a cero.")
+  }
+  vueltasStint <- vueltas$lap_end_stint - vueltas$lap_start_stint + 1
+  vueltas$vueltas_desde_salida <- vueltas$lap_number - vueltas$lap_start_stint
+  vueltas$simulacro_qualy <- vueltas$compound %in% "SOFT" &
+    vueltasStint <= combustible$maxVueltasQualy
+  consumo <- combustible$consumo * ifelse(vueltas$simulacro_qualy, combustible$factorQualy, 1)
+  vueltas$carga_estimada <- consumo * (vueltasStint - vueltas$vueltas_desde_salida) +
+    combustible$consumo * combustible$margenVueltas
+  vueltas$tiempo_corregido <- vueltas$lap_duration -
+    combustible$sensibilidad * vueltas$carga_estimada
+  return(vueltas)
+}
+
+# Parametros de combustible de un GP. El consumo por vuelta de carrera es la carga
+# de carrera de su reglamento dividida por las vueltas de la carrera:
+# - hasta 2025: kgCarrera["hasta2025"] (105 kg; Heilmeier et al. usan 100-110 kg y el
+#   limite de 110 kg no se encontro en los reglamentos revisados);
+# - desde 2026: kgCarrera["desde2026"] (70 kg; objetivo de consumo informado por F1,
+#   no un limite reglamentario; el reglamento limita la energia, 3000 MJ/h).
+# sensibilidad: s/kg = efectoCarrera / kg. efectoCarrera son los segundos que gana el
+# auto entre la primera y la ultima vuelta por combustible y evolucion de la pista:
+# 3,3 s, mediana de una regresion por carrera (t = piloto + compuesto + edad + vuelta)
+# en los 54 GP secos de tres practicas, casos incluidos (3,1 s sin los casos). Asi el
+# efecto por vuelta es 3,3 / vueltas, y no depende de la carga supuesta en kg.
+# factorQualy (1,25) sale de estimaciones publicas de foros
+# (unos 2-2,8 kg/vuelta en clasificacion contra 1,7-2,3 en carrera): baja confianza.
+combustibleGP <- function(gp, rutaBase, parametros) {
+  distancia <- vueltasDeCarrera(rutaBase, gp$meeting_key)
+  if (!is.finite(distancia$valor)) stop("No se conoce la distancia de la carrera del GP.")
+  cfg <- parametros$combustible
+  kg <- if (gp$temporada >= 2026) cfg$kgCarrera[["desde2026"]] else cfg$kgCarrera[["hasta2025"]]
+  list(sensibilidad = cfg$efectoCarrera / kg, consumo = kg / distancia$valor, kgCarrera = kg,
+       vueltasCarrera = distancia$valor, factorQualy = cfg$factorQualy,
+       maxVueltasQualy = cfg$maxVueltasQualy, margenVueltas = cfg$margenVueltas)
+}
+
 # Revisar las tres practicas del GP seleccionado, sin mezclar sus stints.
 # Una practica descartada por clima figura en el resumen pero no aporta vueltas.
 # Un problema de descarga en una sesion no impide revisar las otras.
-revisarPracticasPiloto <- function(seleccion, revisionClima, rutaBase) {
+revisarPracticasPiloto <- function(seleccion, revisionClima, rutaBase, combustible) {
   practicas <- revisionClima[
     revisionClima$meeting_key %in% seleccion$granPremio$meeting_key,
   ]
@@ -925,6 +1016,7 @@ revisarPracticasPiloto <- function(seleccion, revisionClima, rutaBase) {
   # Los residuos se evaluan con las tres practicas juntas, porque la escala de
   # una practica con pocos residuos se toma de las tres practicas del piloto.
   vueltasTodas <- marcarResiduosAtipicos(vueltasTodas)
+  vueltasTodas <- corregirCombustible(vueltasTodas, combustible)
   for (i in which(!is.na(resumen$vueltas_candidatas_ajuste))) {
     deSesion <- vueltasTodas$session_key %in% resumen$session_key[i]
     estado <- vueltasTodas$estado_residuo[deSesion]
@@ -941,6 +1033,601 @@ revisarPracticasPiloto <- function(seleccion, revisionClima, rutaBase) {
   rownames(vueltasTodas) <- NULL
   rownames(stintsTodos) <- NULL
   return(list(resumen = resumen, vueltas = vueltasTodas, stints = stintsTodos))
+}
+
+# ---------------------------------------------------------------------------
+# Modelo, estrategias y evaluacion. Las formulas estan en modeloEstrategias.R;
+# aca solo se leen datos de SQLite y se arma cada caso.
+# ---------------------------------------------------------------------------
+
+# Leer el equipo de cada piloto en las practicas seleccionadas.
+# Un equipo vacio se ignora: ese piloto queda sin companero (por ejemplo Hungria 2023).
+leerEquiposPracticas <- function(rutaBase, clavesSesiones) {
+  conexion <- dbConnect(SQLite(), dbname = rutaBase, flags = RSQLite::SQLITE_RO)
+  on.exit(dbDisconnect(conexion), add = TRUE)
+  marcadores <- paste(rep("?", length(clavesSesiones)), collapse = ",")
+  equipos <- dbGetQuery(conexion, paste0(
+    "SELECT DISTINCT driver_number, team_name FROM pilotos WHERE session_key IN (",
+    marcadores, ")"), params = as.list(clavesSesiones))
+  equipos <- equipos[!is.na(equipos$team_name) & nzchar(trimws(equipos$team_name)), ]
+  # Un dorsal con dos equipos distintos no se asocia a ninguno.
+  ambiguos <- equipos$driver_number[duplicated(equipos$driver_number)]
+  equipos[!equipos$driver_number %in% ambiguos, ]
+}
+
+# Companeros: otros dorsales con el mismo equipo en ese GP (incluye reservas de FP1,
+# que usan el mismo auto).
+companerosDe <- function(dorsal, equipos) {
+  equipo <- equipos$team_name[equipos$driver_number %in% dorsal]
+  if (length(equipo) != 1) return(integer())
+  setdiff(equipos$driver_number[equipos$team_name == equipo], dorsal)
+}
+
+# Revisar las practicas de TODOS los pilotos de un GP y resumir el campo:
+# degradacion porcentual por compuesto y bases de cada piloto (modeloEstrategias.R).
+campoGP <- function(gp, dorsales, clavesSesiones, revisionClima, rutaBase, parametros) {
+  combustible <- combustibleGP(gp, rutaBase, parametros)
+  revisiones <- lapply(dorsales, function(d) revisarPracticasPiloto(
+    list(granPremio = gp, piloto = data.frame(driver_number = d)),
+    revisionClima, rutaBase, combustible))
+  names(revisiones) <- as.character(dorsales)
+  aptas <- do.call(rbind, lapply(revisiones, function(r) aptasCompuestos(r$vueltas)))
+  degradacion <- degradacionCampo(aptas, parametros$minAptas, parametros$minRango,
+                                  parametros$minPilotosCampo)
+  list(revisiones = revisiones, aptas = aptas, degradacion = degradacion,
+       bases = basesCampo(aptas, degradacion, parametros$minAptasBase),
+       equipos = leerEquiposPracticas(rutaBase, clavesSesiones),
+       combustible = combustible)
+}
+
+# Modelo de un piloto a partir del campo de su GP. Con parametros$calibracion se usa
+# el modelo calibrado (vigente); con calibracion = NULL, la cadena de respaldo sin
+# calibrar, que se conserva para comparar.
+modeloDePiloto <- function(dorsal, campo, parametros) {
+  if (!is.null(parametros$calibracion)) {
+    return(agregarCaida(modeloPilotoCalibrado(dorsal, campo$bases, campo$degradacion,
+                                              parametros$calibracion, parametros$pendienteMinima),
+                        parametros$caida))
+  }
+  modeloPiloto(dorsal, campo$bases, campo$degradacion, companerosDe(dorsal, campo$equipos),
+               parametros$minPilotosCampo, parametros$pendienteMinima)
+}
+
+# Leer la carrera (no Sprint) de un GP con sus descargas verificadas.
+leerCarreraGP <- function(rutaBase, meetingKey) {
+  conexion <- dbConnect(SQLite(), dbname = rutaBase, flags = RSQLite::SQLITE_RO)
+  on.exit(dbDisconnect(conexion), add = TRUE)
+  sesion <- dbGetQuery(conexion,
+    "SELECT * FROM sesiones WHERE meeting_key = ? AND nombre = 'Race'
+     AND presente_en_fuente = 1", params = list(meetingKey))
+  if (nrow(sesion) != 1) return(list(sesion = sesion, verificada = FALSE))
+  clave <- list(sesion$session_key)
+  leer <- function(tabla) dbGetQuery(conexion, paste(
+    "SELECT * FROM", tabla, "WHERE session_key = ?"), params = clave)
+  carrera <- list(sesion = sesion, vueltas = leer("vueltas"), stints = leer("stints"),
+                  control = leer("control_carrera"), clima = leer("clima"))
+  descargas <- dbGetQuery(conexion,
+    "SELECT endpoint, estado, filas FROM descargas
+     WHERE endpoint IN ('laps', 'stints', 'race_control', 'weather')
+     AND json_extract(parametros_json, '$.session_key') = ?", params = clave)
+  filas <- c(laps = nrow(carrera$vueltas), stints = nrow(carrera$stints),
+             race_control = nrow(carrera$control), weather = nrow(carrera$clima))
+  carrera$verificada <- nrow(descargas) == 4 && anyDuplicated(descargas$endpoint) == 0 &&
+    all(descargas$estado == "ok") && all(descargas$filas == filas[descargas$endpoint])
+  carrera
+}
+
+# Comprobar si una carrera sirve para evaluar en la version de investigacion:
+# seca durante la carrera Y en las observaciones previas a la largada (cubren unos
+# 50-60 minutos; se exigen al menos minMinutosPrevios), sin bandera roja y sin SC/VSC.
+# Los casos con SC/VSC quedan para cuando el algoritmo incluya neutralizaciones.
+estadoCarreraEvaluable <- function(carrera, minMinutosPrevios = 30) {
+  if (!isTRUE(carrera$verificada)) return("carrera_no_verificada")
+  inicio <- aFechaUTC(carrera$sesion$fecha_inicio)
+  fin <- aFechaUTC(carrera$sesion$fecha_fin)
+  fechas <- aFechaUTC(carrera$clima$date)
+  durante <- carrera$clima$rainfall[fechas >= inicio & fechas <= fin]
+  previa <- carrera$clima$rainfall[fechas < inicio]
+  if (length(durante) == 0 || !all(durante %in% 0)) return("lluvia_en_carrera")
+  minutos <- if (length(previa) > 0) {
+    as.numeric(difftime(inicio, min(fechas[fechas < inicio]), units = "mins"))
+  } else 0
+  if (minutos < minMinutosPrevios) return("sin_clima_previo_suficiente")
+  if (!all(previa %in% 0)) return("lluvia_antes_de_largar")
+  bandera <- carrera$control$flag
+  mensaje <- toupper(ifelse(is.na(carrera$control$message), "", carrera$control$message))
+  if (any(bandera %in% "RED") || any(mensaje == "SESSION ABORTED")) return("bandera_roja")
+  if (any(grepl("SAFETY CAR DEPLOYED|VSC DEPLOYED", mensaje))) return("sc_vsc")
+  "ok"
+}
+
+# Ultima vuelta real de una carrera: la mayor con alguna duracion registrada.
+# En algunas carreras OpenF1 agrega una vuelta final sin duracion para todos (por
+# ejemplo Miami 2023 figura con 58 vueltas y se corrieron 57).
+ultimaVueltaReal <- function(vueltas) {
+  conDuracion <- vueltas$lap_number[is.finite(vueltas$lap_duration)]
+  if (length(conDuracion) == 0) NA_real_ else max(conDuracion)
+}
+
+# Estrategia real de un piloto en la carrera y si la termino (aunque fuera doblado):
+# su ultima vuelta empezo a menos de 150 s de la bandera a cuadros. Si falta el
+# mensaje de bandera a cuadros (Monza 2023), se usa el final de la vuelta del lider:
+# el mayor (inicio + duracion) de la ultima vuelta real.
+estrategiaRealPiloto <- function(carrera, dorsal) {
+  s <- carrera$stints[carrera$stints$driver_number %in% dorsal, ]
+  s <- s[order(s$stint_number), c("stint_number", "compound", "lap_start", "lap_end",
+                                  "tyre_age_at_start")]
+  ultima <- ultimaVueltaReal(carrera$vueltas)
+  s$lap_end <- pmin(s$lap_end, ultima)
+  todas <- carrera$vueltas[carrera$vueltas$lap_number <= ultima, ]
+  v <- todas[todas$driver_number %in% dorsal, ]
+  bandera <- aFechaUTC(carrera$control$date[carrera$control$flag %in% "CHEQUERED"])
+  if (length(bandera) == 0) {
+    finLider <- todas[todas$lap_number == ultima & is.finite(todas$lap_duration), ]
+    bandera <- aFechaUTC(finLider$date_start) + finLider$lap_duration
+  }
+  termino <- length(bandera) > 0 && nrow(v) > 0 &&
+    isTRUE(as.numeric(difftime(min(bandera), max(aFechaUTC(v$date_start), na.rm = TRUE),
+                               units = "secs")) <= 150)
+  limites <- nrow(s) > 0 && all(is.finite(c(s$lap_start, s$lap_end))) &&
+    all(s$lap_start[-1] == s$lap_end[-nrow(s)] + 1)
+  list(stints = s, termino = termino, paradas = nrow(s) - 1,
+       compuestos_conocidos = nrow(s) > 0 && all(s$compound %in% compuestosSecos),
+       limites_consistentes = limites,
+       vueltas_parada = if (nrow(s) > 1) s$lap_end[-nrow(s)] else integer())
+}
+
+# Vueltas de carrera del piloto anotadas con las mismas marcas que las practicas.
+# Limpias para evaluar: no la vuelta 1 (largada), sin boxes ni neutralizacion,
+# con stint unico y numero no repetido.
+vueltasCarreraPiloto <- function(carrera, dorsal) {
+  v <- carrera$vueltas[carrera$vueltas$driver_number %in% dorsal, ]
+  s <- carrera$stints[carrera$stints$driver_number %in% dorsal, ]
+  inicio <- aFechaUTC(carrera$sesion$fecha_inicio) - 3600
+  fin <- aFechaUTC(carrera$sesion$fecha_fin) + 3 * 3600
+  v <- anotarVueltasPiloto(v, s, inicio, fin)
+  v <- marcarVueltasNoRepresentativas(v, armarIntervalosControl(carrera$control, fin), TRUE)
+  v$limpia_carrera <- v$lap_number > 1 & v$candidata_ajuste
+  v[order(v$lap_number), ]
+}
+
+# Orden de llegada APROXIMADO de cada carrera desde las vueltas: mas vueltas primero y,
+# a igualdad, quien empezo antes su ultima vuelta. No incluye penalizaciones.
+reconstruirPosiciones <- function(rutaBase) {
+  conexion <- dbConnect(SQLite(), dbname = rutaBase, flags = RSQLite::SQLITE_RO)
+  on.exit(dbDisconnect(conexion), add = TRUE)
+  carreras <- dbGetQuery(conexion, "SELECT session_key, fecha_inicio FROM sesiones
+    WHERE nombre = 'Race' ORDER BY fecha_inicio")
+  filas <- lapply(carreras$session_key, function(k) {
+    v <- dbGetQuery(conexion, "SELECT driver_number, max(lap_number) vueltas,
+      max(date_start) ultima FROM vueltas WHERE session_key = ? GROUP BY driver_number",
+      params = list(k))
+    if (nrow(v) == 0) return(NULL)
+    v <- v[order(-v$vueltas, v$ultima), ]
+    data.frame(fecha = carreras$fecha_inicio[carreras$session_key == k],
+               driver_number = v$driver_number, posicion = seq_len(nrow(v)))
+  })
+  do.call(rbind, filas)
+}
+
+# Posicion media en las n carreras ANTERIORES a la fecha: informacion previa a la largada.
+posicionMediaPrevia <- function(posiciones, dorsal, fechaCarrera, n = 5) {
+  previas <- posiciones[posiciones$driver_number %in% dorsal &
+                          aFechaUTC(posiciones$fecha) < aFechaUTC(fechaCarrera), ]
+  previas <- tail(previas[order(previas$fecha), ], n)
+  list(media = if (nrow(previas) > 0) mean(previas$posicion) else NA_real_,
+       carreras = nrow(previas))
+}
+
+# Perdida por parada del circuito, estimada con OTRAS ediciones de su carrera.
+# Se prefieren las anteriores; si no hay, se usan las posteriores y se avisa.
+# Nunca se usa la carrera evaluada.
+estimarPerdidaBoxes <- function(rutaBase, meetingKey) {
+  conexion <- dbConnect(SQLite(), dbname = rutaBase, flags = RSQLite::SQLITE_RO)
+  ediciones <- dbGetQuery(conexion,
+    "SELECT g.meeting_key, g.temporada, s.fecha_inicio FROM grandes_premios g
+     JOIN sesiones s ON s.meeting_key = g.meeting_key AND s.nombre = 'Race'
+     WHERE g.circuito_key = (SELECT circuito_key FROM grandes_premios WHERE meeting_key = ?)
+     ORDER BY s.fecha_inicio", params = list(meetingKey))
+  dbDisconnect(conexion)
+  fechaObjetivo <- ediciones$fecha_inicio[ediciones$meeting_key == meetingKey]
+  otras <- ediciones[ediciones$meeting_key != meetingKey, ]
+  anteriores <- if (length(fechaObjetivo) == 1) {
+    otras[aFechaUTC(otras$fecha_inicio) < aFechaUTC(fechaObjetivo), ]
+  } else otras
+  origen <- "ediciones_anteriores"
+  usar <- anteriores
+  if (nrow(usar) == 0) {
+    usar <- otras
+    origen <- "ediciones_posteriores"
+  }
+
+  perdidas <- numeric()
+  usadas <- integer()
+  for (m in usar$meeting_key) {
+    carrera <- leerCarreraGP(rutaBase, m)
+    if (!isTRUE(carrera$verificada) || nrow(carrera$vueltas) == 0) next
+    v <- carrera$vueltas
+    fin <- aFechaUTC(carrera$sesion$fecha_fin) + 3 * 3600
+    intervalos <- armarIntervalosControl(carrera$control, fin)
+    intervalos <- intervalos[intervalos$tipo %in% c("bandera_roja", "vsc_sc"), ]
+    inicioV <- aFechaUTC(v$date_start)
+    finV <- inicioV + ifelse(is.finite(v$lap_duration), v$lap_duration, NA_real_)
+    v$neutralizada <- FALSE
+    for (k in seq_len(nrow(intervalos))) {
+      v$neutralizada <- v$neutralizada |
+        (inicioV <= intervalos$hasta[k] & finV >= intervalos$desde[k]) %in% TRUE
+    }
+    # Una salida de boxes con cambio de neumatico empieza un stint nuevo.
+    nuevos <- carrera$stints[carrera$stints$stint_number > 1, ]
+    v$cambio_neumatico <- paste(v$driver_number, v$lap_number) %in%
+      paste(nuevos$driver_number, nuevos$lap_start)
+    p <- calcularPerdidasParadas(v)
+    if (length(p) > 0) {
+      perdidas <- c(perdidas, p)
+      usadas <- c(usadas, usar$temporada[usar$meeting_key == m])
+    }
+  }
+  list(valor = if (length(perdidas) > 0) median(perdidas) else NA_real_,
+       origen = if (length(perdidas) > 0) origen else "sin_datos",
+       temporadas = usadas, paradas = length(perdidas))
+}
+
+# Distancia de la carrera en vueltas: la de la carrera del GP si ya esta en la base
+# (distancia programada, conocida antes de largar); si no, la ultima edicion del circuito.
+vueltasDeCarrera <- function(rutaBase, meetingKey) {
+  conexion <- dbConnect(SQLite(), dbname = rutaBase, flags = RSQLite::SQLITE_RO)
+  on.exit(dbDisconnect(conexion), add = TRUE)
+  # Solo vueltas con duracion: ver ultimaVueltaReal().
+  propia <- dbGetQuery(conexion, "SELECT max(v.lap_number) n FROM vueltas v
+    JOIN sesiones s ON s.session_key = v.session_key
+    WHERE s.meeting_key = ? AND s.nombre = 'Race' AND v.lap_duration IS NOT NULL",
+    params = list(meetingKey))$n
+  if (is.finite(propia)) return(list(valor = propia, origen = "carrera_del_gp"))
+  otra <- dbGetQuery(conexion, "SELECT max(v.lap_number) n FROM vueltas v
+    JOIN sesiones s ON s.session_key = v.session_key
+    JOIN grandes_premios g ON g.meeting_key = s.meeting_key
+    WHERE s.nombre = 'Race' AND v.lap_duration IS NOT NULL AND g.circuito_key =
+      (SELECT circuito_key FROM grandes_premios WHERE meeting_key = ?)
+    GROUP BY s.session_key ORDER BY s.fecha_inicio DESC LIMIT 1",
+    params = list(meetingKey))$n
+  if (length(otra) == 1 && is.finite(otra)) {
+    return(list(valor = otra, origen = "ultima_edicion_del_circuito"))
+  }
+  list(valor = NA_real_, origen = "sin_datos")
+}
+
+# Mostrar un valor y permitir cambiarlo con Enter para aceptarlo.
+confirmarNumero <- function(texto, valor, leer = readline) {
+  if (!interactive() && identical(leer, readline)) return(valor)
+  repeat {
+    respuesta <- trimws(leer(paste0(texto, " [", valor, "]: ")))
+    if (respuesta == "" && is.finite(valor)) return(valor)
+    numero <- suppressWarnings(as.numeric(sub(",", ".", respuesta)))
+    if (is.finite(numero) && numero > 0) return(numero)
+    cat("Ingresa un numero positivo.\n")
+  }
+}
+
+# Pilotos elegibles de un GP segun el modo:
+# - "uso": los 3 compuestos secos con modelo suficiente (practicas; la base puede
+#   venir de la cadena de respaldo de modeloPiloto()).
+# - "investigacion": ademas, carrera evaluable, piloto terminado, 1 o 2 paradas,
+#   compuestos de carrera conocidos. Se ordena primero a los pilotos con posicion
+#   media previa en el top 10 (en sus 5 carreras anteriores, al menos 3).
+pilotosElegiblesGP <- function(gp, pilotos, tramos, modo, revisionClima, rutaBase,
+                               parametros, posiciones = NULL) {
+  carrera <- NULL
+  if (modo == "investigacion") {
+    carrera <- leerCarreraGP(rutaBase, gp$meeting_key)
+    if (estadoCarreraEvaluable(carrera) != "ok") return(pilotos[0, ])
+  }
+  campo <- campoGP(gp, pilotos$driver_number, tramos$session_key, revisionClima,
+                   rutaBase, parametros)
+  pilotos$etiqueta_extra <- ""
+  pilotos$prioridad <- NA_real_
+  elegible <- logical(nrow(pilotos))
+  for (i in seq_len(nrow(pilotos))) {
+    d <- pilotos$driver_number[i]
+    modelo <- modeloDePiloto(d, campo, parametros)
+    elegible[i] <- all(modelo$suficiente)
+    if (elegible[i] && modo == "investigacion") {
+      real <- estrategiaRealPiloto(carrera, d)
+      elegible[i] <- real$termino && real$paradas %in% 1:2 &&
+        real$compuestos_conocidos && real$limites_consistentes
+      if (elegible[i] && !is.null(posiciones)) {
+        previa <- posicionMediaPrevia(posiciones, d, carrera$sesion$fecha_inicio)
+        pilotos$prioridad[i] <- previa$media
+        destacado <- isTRUE(previa$media <= 10 && previa$carreras >= 3)
+        pilotos$etiqueta_extra[i] <- sprintf("- pos. media previa %.1f%s",
+                                             previa$media, if (destacado) " [top 10 previo]" else "")
+      }
+    }
+  }
+  elegibles <- pilotos[elegible, ]
+  elegibles[order(elegibles$prioridad, na.last = TRUE), ]
+}
+
+# Analizar un caso completo: modelo, estrategias y, en investigacion, evaluacion
+# contra la carrera real con graficos. Devuelve una lista con todos los resultados.
+analizarCaso <- function(seleccion, modo, revisionClima, rutaBase, parametros,
+                         leer = readline, carpetaGraficos = "resultados") {
+  gp <- seleccion$granPremio
+  dorsal <- seleccion$piloto$driver_number
+  pilotosGP <- leerPilotosPracticas(rutaBase, seleccion$tramos$session_key)
+  dorsales <- unique(c(dorsal, pilotosGP$driver_number))
+  campo <- campoGP(gp, dorsales, seleccion$tramos$session_key, revisionClima, rutaBase,
+                   parametros)
+  modelo <- modeloDePiloto(dorsal, campo, parametros)
+  combustible <- campo$combustible
+
+  cat("\n=== Modelo por compuesto (t = base + pendiente * edad) ===\n")
+  cat(sprintf(paste("Combustible: %.0f kg de carrera / %d vueltas = %.2f kg/vuelta;",
+                    "sensibilidad %.3f s/kg (parametros configurados).\n"),
+              combustible$kgCarrera, combustible$vueltasCarrera, combustible$consumo,
+              combustible$sensibilidad))
+  cat("Base: segundos a edad 0 con tanque casi vacio (carga de practica estimada).\n")
+  cat("Pendiente: base x degradacion porcentual de todos los pilotos del GP.\n")
+  if (!is.null(parametros$calibracion)) {
+    cat("Calibrado: degradacion x factor practica->carrera; SOFT y HARD desde el MEDIUM",
+        "propio con la diferencia de carrera; base con correccion de nivel de",
+        parametros$calibracion$nivelBase, "% (constantes de parametros$calibracion).\n")
+  }
+  tabla <- modelo
+  tabla$base <- round(tabla$base, 3)
+  tabla$degradacion_pct <- round(tabla$degradacion_pct, 3)
+  tabla$pendiente <- round(tabla$pendiente, 3)
+  tabla$pendiente_usada <- round(tabla$pendiente_usada, 3)
+  print(tabla[, c("compound", "suficiente", "origen_base", "base", "origen_pendiente",
+                  "degradacion_pct", "pendiente", "pendiente_usada", "vueltas_propias",
+                  "pilotos_pendiente", "pilotos_base", "edad_max_observada")],
+        row.names = FALSE)
+  if (any(modelo$origen_base %in% c("campo_pareado", "companero"))) {
+    cat("Advertencia: alguna base sale de la diferencia con el MEDIUM de otros pilotos.\n")
+  }
+  if (any(modelo$origen_base %in% "igual_medio") ||
+      any(modelo$origen_pendiente %in% c("campo_medio", "medio_calibrado"))) {
+    cat("Advertencia: alguna degradacion o base se deriva del MEDIUM (escenario",
+        "condicionado).\n")
+  }
+  if (any(modelo$pendiente < modelo$pendiente_usada, na.rm = TRUE)) {
+    cat("Advertencia: hay pendientes estimadas menores a", parametros$pendienteMinima,
+        "; en las estrategias se usa", parametros$pendienteMinima, ".\n")
+  }
+  if (!all(modelo$suficiente)) {
+    cat("No hay datos suficientes para los tres compuestos: no se buscan estrategias.\n")
+    return(list(modelo = modelo))
+  }
+
+  distancia <- vueltasDeCarrera(rutaBase, gp$meeting_key)
+  cat("\nDistancia de carrera:", distancia$valor, "vueltas (", distancia$origen, ")\n")
+  nVueltas <- round(confirmarNumero("Vueltas de carrera", distancia$valor, leer))
+  combustible$consumo <- combustible$kgCarrera / nVueltas
+  boxes <- estimarPerdidaBoxes(rutaBase, gp$meeting_key)
+  cat("Perdida por parada estimada:", round(boxes$valor, 2), "s (", boxes$origen,
+      "; temporadas", paste(unique(boxes$temporadas), collapse = ", "), ";",
+      boxes$paradas, "paradas)\n")
+  if (boxes$paradas < 5) {
+    cat("Advertencia: la perdida se estimo con menos de 5 paradas; conviene revisarla",
+        "e ingresar un valor documentado.\n")
+  }
+  if (boxes$origen == "ediciones_posteriores") {
+    cat("Advertencia: no hay ediciones anteriores; se uso una edicion posterior del circuito.\n")
+  }
+  perdida <- confirmarNumero("Perdida por parada (s)", round(boxes$valor, 2), leer)
+  if (!is.finite(nVueltas) || !is.finite(perdida)) {
+    cat("Faltan la distancia o la perdida por parada: no se buscan estrategias.\n")
+    return(list(modelo = modelo))
+  }
+
+  # Reglamento deportivo 2025, art. 30: en Monaco cada piloto debe usar al menos tres
+  # juegos, es decir, dos paradas. 2023, 2024 y 2026 no se verificaron para Monaco.
+  paradas <- parametros$paradas
+  if (gp$temporada == 2025 && isTRUE(gp$nombre == "Monaco Grand Prix")) {
+    paradas <- intersect(paradas, 2)
+    cat("Monaco 2025: el reglamento exige tres juegos; solo se comparan estrategias de 2 paradas.\n")
+  }
+  estrategias <- generarEstrategias(nVueltas, modelo, perdida, paradas,
+                                    parametros$minVueltasStint, parametros$edadInicial,
+                                    parametros$maxFactorEdad, parametros$vidaMaxima)
+  if (nrow(estrategias) == 0) {
+    cat("No hay estrategias admisibles con las restricciones configuradas",
+        "(revisar maxFactorEdad, vidaMaxima o minVueltasStint).\n")
+    return(list(modelo = modelo))
+  }
+  mejores <- mejoresEstrategias(estrategias, parametros$maxEstrategias)
+  recomendada <- list(
+    compuestos = strsplit(mejores$secuencia[1], "-")[[1]],
+    largos = diff(c(0, as.numeric(strsplit(mejores$vueltas_parada[1], "-")[[1]]), nVueltas)))
+  cat("\n=== Mejores estrategias del modelo (juegos nuevos, sin neutralizaciones) ===\n")
+  cat("En este modelo el orden de los stints no cambia el tiempo: se muestra un orden",
+      "por cada combinacion de compuestos.\n")
+  salida <- mejores[, c("paradas", "secuencia", "vueltas_parada", "stints", "diferencia",
+                        "extrapola")]
+  salida$diferencia <- round(salida$diferencia, 1)
+  print(salida, row.names = FALSE)
+  # Margen de empate: con la calibracion vigente se simula su incertidumbre.
+  real <- NULL
+  carrera <- NULL
+  if (modo == "investigacion") {
+    carrera <- leerCarreraGP(rutaBase, gp$meeting_key)
+    real <- estrategiaRealPiloto(carrera, dorsal)
+  }
+  margen <- list(margen = NA_real_, prob_real_mejor = NA_real_)
+  empatadas <- character()
+  if (!is.null(parametros$calibracion) && !is.null(parametros$incertidumbre)) {
+    inc <- parametros$incertidumbre
+    margen <- margenEmpate(modelo, nVueltas, perdida, inc$residuos, recomendada,
+                           if (!is.null(real)) list(compuestos = real$stints$compound,
+                                                    largos = diff(c(0, real$vueltas_parada, nVueltas))),
+                           paradas, parametros$minVueltasStint, parametros$edadInicial,
+                           parametros$maxFactorEdad, inc$simulaciones, inc$cuantil,
+                           vidaMaxima = parametros$vidaMaxima)
+    empatadas <- combinacionesEmpatadas(estrategias, margen$margen)
+    cat(sprintf(paste("Margen de empate: %.1f s (la recomendada pierde menos que eso frente a",
+                      "la mejor en el %.0f %% de %d simulaciones de la calibracion).\n"),
+                margen$margen, 100 * inc$cuantil, inc$simulaciones))
+    cat("Combinaciones empatadas con la mejor:", paste(empatadas, collapse = "; "), "\n")
+  } else {
+    cat("Diferencias de pocas decimas no son ventajas demostradas.\n")
+  }
+  if (any(mejores$extrapola)) {
+    cat("Advertencia: alguna estrategia usa edades mayores a las observadas (extrapolacion).\n")
+  }
+
+  neutralizaciones <- NULL
+  if (!is.null(parametros$neutralizacion)) {
+    fechaCarrera <- if (!is.null(carrera)) carrera$sesion$fecha_inicio else
+      sesiones$fecha_inicio[sesiones$meeting_key == gp$meeting_key & sesiones$nombre == "Race"][1]
+    if (is.na(fechaCarrera)) fechaCarrera <- format(Sys.time(), "%Y-%m-%dT%H:%M:%S", tz = "UTC")
+    neutralizaciones <- analizarNeutralizaciones(gp, fechaCarrera, mejores[1, ], modelo, nVueltas,
+                                                 perdida, parametros, rutaBase)
+  }
+
+  resultado <- list(modelo = modelo, estrategias = estrategias, mejores = mejores,
+                    nVueltas = nVueltas, perdida = perdida, boxes = boxes,
+                    combustible = combustible, degradacionCampo = campo$degradacion,
+                    margen = margen, empatadas = empatadas, neutralizaciones = neutralizaciones)
+  if (modo != "investigacion") return(resultado)
+
+  # --- Comparacion con la carrera real (solo investigacion) ---
+  vueltasCarrera <- vueltasCarreraPiloto(carrera, dorsal)
+  prediccion <- predecirVueltas(real$stints, modelo, combustible, nVueltas)
+  comparacion <- compararVueltas(prediccion, vueltasCarrera[vueltasCarrera$limpia_carrera, ])
+  largos <- diff(c(0, real$vueltas_parada, nVueltas))
+  tiempoReal <- tiempoEstrategia(real$stints$compound, largos, modelo, perdida,
+                                 parametros$edadInicial)
+  puesto <- puestoEstrategia(tiempoReal, estrategias)
+
+  cat("\n=== Comparacion con la carrera real ===\n")
+  cat("Estrategia real:", paste(real$stints$compound, collapse = "-"), "parando al final de",
+      paste(real$vueltas_parada, collapse = " y "), "\n")
+  cat("Recomendada:", mejores$secuencia[1], "parando al final de",
+      gsub("-", " y ", mejores$vueltas_parada[1]), "\n")
+  cat(sprintf("Estrategia real en el modelo: %.1f s peor que la mejor; puesto %d de %d.\n",
+              tiempoReal - mejores$tiempo_modelo[1], puesto, nrow(estrategias)))
+  combinacionReal <- paste(real$paradas, "parada(s):",
+                           paste(sort(unique(real$stints$compound)), collapse = "+"))
+  realEmpatada <- combinacionReal %in% empatadas
+  if (is.finite(margen$margen)) {
+    cat(sprintf(paste("Dentro del margen de empate: %s. Combinacion real empatada con la mejor: %s.",
+                      "La real es mas rapida que la recomendada en el %.0f %% de las simulaciones.\n"),
+                if (tiempoReal - mejores$tiempo_modelo[1] <= margen$margen) "si" else "no",
+                if (realEmpatada) "si" else "no", 100 * margen$prob_real_mejor))
+  }
+  cat(sprintf("Vueltas limpias comparadas: %d\n", comparacion$n))
+  cat(sprintf("Error absoluto medio: %.2f s (incluye el desplazamiento de nivel)\n",
+              comparacion$mae_absoluto))
+  cat(sprintf("Desplazamiento de nivel (mediana real - prevista): %+.2f s\n",
+              comparacion$desplazamiento))
+  cat(sprintf("Error absoluto medio tras restar ese desplazamiento: %.2f s\n",
+              comparacion$mae_ajustado))
+  cat("Estas medidas evaluan UN caso; no demuestran que el modelo prediga en general.\n")
+
+  aptas <- campo$aptas[campo$aptas$driver_number %in% dorsal, ]
+  caso <- list(comparacion = comparacion, vueltasCarrera = vueltasCarrera,
+               paradasReales = real$vueltas_parada,
+               paradasRecomendadas = as.numeric(strsplit(mejores$vueltas_parada[1], "-")[[1]]),
+               mejores = mejores, diferenciaReal = tiempoReal - mejores$tiempo_modelo[1],
+               secuenciaReal = paste(real$stints$compound, collapse = "-"),
+               vueltasParadaReal = paste(real$vueltas_parada, collapse = "-"),
+               practicaAptas = aptas, modelo = modelo, margen = margen$margen,
+               sc = if (is.null(neutralizaciones)) NULL else neutralizaciones$decisiones)
+  dir.create(carpetaGraficos, showWarnings = FALSE)
+  archivo <- file.path(carpetaGraficos, gsub("[^A-Za-z0-9_]+", "_", paste(
+    seleccion$temporada, gp$nombre, seleccion$piloto$driver_number, sep = "_")))
+  archivo <- paste0(archivo, ".png")
+  if (is.null(caso$sc)) png(archivo, width = 1800, height = 600, res = 110) else
+    png(archivo, width = 1500, height = 1100, res = 110)
+  graficarCaso(caso)
+  dev.off()
+  if (interactive()) graficarCaso(caso)
+  cat("Graficos guardados en", archivo, "\n")
+
+  c(resultado, list(real = real, comparacion = comparacion, tiempoReal = tiempoReal,
+                    puesto = puesto, realEmpatada = realEmpatada, caso = caso,
+                    archivoGraficos = archivo))
+}
+
+# Historial de neutralizaciones de todas las carreras de la base (solo OpenF1): una fila
+# por carrera (seca, con o sin SC/VSC) y los episodios reconstruidos. Se calcula una
+# vez por sesion de R y se guarda en memoria; cada caso usa solo carreras ANTERIORES.
+.memoNeutralizaciones <- new.env()
+historialNeutralizaciones <- function(rutaBase) {
+  if (!is.null(.memoNeutralizaciones$h)) return(.memoNeutralizaciones$h)
+  conexion <- dbConnect(SQLite(), dbname = rutaBase, flags = RSQLite::SQLITE_RO)
+  carreras <- dbGetQuery(conexion, "SELECT s.meeting_key, s.fecha_inicio, g.circuito_key
+    FROM sesiones s JOIN grandes_premios g ON g.meeting_key = s.meeting_key
+    WHERE s.nombre = 'Race' AND s.presente_en_fuente = 1")
+  dbDisconnect(conexion)
+  filas <- list(); episodios <- list()
+  for (i in seq_len(nrow(carreras))) {
+    car <- leerCarreraGP(rutaBase, carreras$meeting_key[i])
+    if (!isTRUE(car$verificada) || nrow(car$vueltas) == 0) next
+    f <- aFechaUTC(car$clima$date)
+    ll <- car$clima$rainfall[f >= aFechaUTC(car$sesion$fecha_inicio) & f <= aFechaUTC(car$sesion$fecha_fin)]
+    if (length(ll) == 0 || !all(ll %in% 0) || any(car$stints$compound %in% c("INTERMEDIATE", "WET"))) next
+    e <- episodiosNeutralizacion(car$control)
+    N <- ultimaVueltaReal(car$vueltas)
+    filas[[length(filas) + 1]] <- data.frame(meeting_key = carreras$meeting_key[i],
+      fecha = carreras$fecha_inicio[i], circuito_key = carreras$circuito_key[i],
+      sc = any(e$tipo == "SC"), vsc = any(e$tipo == "VSC"))
+    if (nrow(e)) episodios[[length(episodios) + 1]] <- data.frame(meeting_key = carreras$meeting_key[i],
+      fecha = carreras$fecha_inicio[i], tipo = e$tipo, vuelta_inicio = e$vuelta_inicio,
+      vueltas = e$vueltas, vueltas_carrera = N)
+  }
+  .memoNeutralizaciones$h <- list(carreras = do.call(rbind, filas), episodios = do.call(rbind, episodios))
+  .memoNeutralizaciones$h
+}
+
+# Respuestas ante un SC para la estrategia recomendada: probabilidad del circuito, momento
+# tipico, decision vuelta por vuelta, ventanas y medida D. Usa solo carreras anteriores al
+# GP. El VSC se dejo afuera: ninguna regla supero a "nunca parar" con datos reales (su
+# beneficio depende de donde esta el auto cuando empieza, que no se conoce de antemano).
+# Devuelve una lista; imprime un resumen.
+analizarNeutralizaciones <- function(gp, fechaCarrera, mejor, modelo, nVueltas, perdida, parametros,
+                                     rutaBase) {
+  cfg <- parametros$neutralizacion
+  h <- historialNeutralizaciones(rutaBase)
+  previas <- h$carreras[aFechaUTC(h$carreras$fecha) < aFechaUTC(fechaCarrera), ]
+  epPrevios <- h$episodios[aFechaUTC(h$episodios$fecha) < aFechaUTC(fechaCarrera), ]
+  if (nrow(previas) < 10) {
+    cat("\nSafety car: menos de 10 carreras secas anteriores; no se estiman probabilidades.\n")
+    return(NULL)
+  }
+  circuito <- grandesPremios$circuito_key[grandesPremios$meeting_key == gp$meeting_key]
+  prob <- probabilidadNeutralizacion(previas, circuito, cfg$k)
+  momento <- momentoNeutralizacion(epPrevios)
+  plan <- list(compuestos = strsplit(mejor$secuencia, "-")[[1]],
+               vueltasParada = as.numeric(strsplit(mejor$vueltas_parada, "-")[[1]]))
+  decisiones <- do.call(rbind, lapply(cfg$tipos, function(t) do.call(rbind, lapply(
+    seq_len(nVueltas - 1), function(L) decisionNeutralizacion(plan, L, t, nVueltas, modelo, perdida,
+      cfg$factorPerdida, cfg$maxParadas, parametros$minVueltasStint, parametros$edadInicial,
+      parametros$maxFactorEdad, parametros$vidaMaxima)))))
+  ventanas <- ventanasNeutralizacion(decisiones, nVueltas, cfg$secciones)
+  D <- medidaD(plan, decisiones, nVueltas, perdida, cfg$factorPerdida, prob$p, momento, cfg$duracion)
+
+  cat("\n=== Safety car ===\n")
+  cat(sprintf("Probabilidad de al menos un SC: %.0f %% (%d carreras secas anteriores; %d de este circuito)\n",
+              100 * prob$p[["SC"]], prob$carreras, prob$ediciones_circuito))
+  if (prob$ediciones_circuito > 0) {
+    cat(sprintf("En este circuito hubo SC en %.0f %% de sus ediciones; se acerca a la tasa general",
+                100 * prob$frecuencia_circuito[["SC"]]),
+        "porque las diferencias entre circuitos no fueron significativas.\n")
+  }
+  cat("Momento de inicio del SC (todas las carreras, % por tramo de 20 %):",
+      paste(round(100 * momento[, "SC"]), collapse = " / "), "\n")
+  cat(sprintf("Perdida por parada: verde %.1f s; bajo SC %.1f s.\n", perdida,
+              cfg$factorPerdida[["SC"]] * perdida))
+  cat("Respuesta ante un SC que empieza en cada seccion (10 % de la carrera):\n")
+  vs <- ventanas$secciones
+  vs$ahorro_mediano <- round(vs$ahorro_mediano, 1)
+  print(vs[, c("desde", "hasta", "accion", "vueltas_con_esa_respuesta", "vueltas", "siguiente",
+               "ahorro_mediano")], row.names = FALSE)
+  cat(sprintf(paste("Medida D (ahorro esperado de adaptarse frente al plan fijo): %.1f s por carrera;",
+                    "si hay SC: %.1f s. Es una diferencia dentro del simulador.\n"),
+              D$esperado, D$condicional[["SC"]]))
+  list(probabilidades = prob, momento = momento, decisiones = decisiones, ventanas = ventanas, D = D)
 }
 
 # Buscar la base dentro de la carpeta del proyecto.
@@ -1473,13 +2160,125 @@ cat(
 # Pedir la seleccion al ejecutar desde la consola de R o Source de RStudio.
 # En una ejecucion automatica con Rscript se omiten los menus para no esperar
 # respuestas. Las funciones se pueden comprobar pasando respuestas de prueba.
-seleccionUsuario <- NULL
-if (interactive()) {
-  seleccionUsuario <- seleccionarAnalisis(
-    gpDisponibles = gpConTramosCandidatos,
-    revisionClima = revisionClima,
-    rutaBase = rutaBase
+
+# Parametros configurables del modelo. Ninguno esta validado: son supuestos declarados.
+parametros <- list(
+  combustible = list(         # ver corregirCombustible() y combustibleGP()
+    kgCarrera = c(hasta2025 = 105, desde2026 = 70),  # kg de combustible por carrera
+    efectoCarrera = 3.3,      # s ganados en toda la carrera (combustible y pista)
+    factorQualy = 1.25,       # consumo de un simulacro de clasificacion / carrera
+    maxVueltasQualy = 6,      # stint de SOFT con a lo sumo estas vueltas = simulacro
+    margenVueltas = 1         # combustible extra, en vueltas de consumo
+  ),
+  minAptas = 8,               # vueltas aptas para que un piloto aporte degradacion
+  minRango = 5,               # rango minimo de edades (vueltas) para aportar degradacion
+  minPilotosCampo = 3,        # pilotos minimos para la degradacion o la base pareada
+  minAptasBase = 3,           # vueltas aptas propias minimas para una base
+  # Practica -> carrera, medido el 10/11/2026 con los 54 GP secos 2023-2026 de tres
+  # practicas, INCLUIDOS los casos de investigacion (decision de Facundo: el programa se
+  # presenta en la facultad; los resultados de esos casos quedan dentro de la muestra).
+  # Mediana entre GP. La carrera sale de una regresion que separa combustible y
+  # degradacion (resultados/regresionCarrera.R, calibracion2.R y constantesTodos.R).
+  # NULL usa el modelo sin calibrar.
+  calibracion = list(
+    factorDegradacion = c(SOFT = 0.44, MEDIUM = 0.58, HARD = 0.69),  # deg carrera / practica
+    difBase = c(SOFT = -0.01, HARD = 0.03),       # % respecto del MEDIUM en carrera
+    relacionDegradacion = c(SOFT = 0.93, HARD = 0.89),  # deg carrera / deg MEDIUM
+    # Carrera mas rapida que practicas, en % de la base: mediana de los 50 GP de tres
+    # practicas con datos suficientes, casos incluidos (IC 95 %: -1,61 a -0,71; sin los
+    # casos, 33 GP, -1,01 %). Ver resultados/errorNivel2.R.
+    nivelBase = -1.12
+  ),
+  minVueltasStint = 5,        # largo minimo de cada stint de carrera
+  maxFactorEdad = 3,          # edad final de un stint <= 3 x edad maxima observada
+  # Vueltas maximas de un juego en carrera (edad al montarlo + stint): percentil 95 de
+  # 3.293 stints de 70 carreras secas 2023-2026 (resultados/vidaStints.R). La caida
+  # final no se pudo medir; esto refleja lo que hacen los equipos. NULL = sin limite.
+  vidaMaxima = c(SOFT = 31, MEDIUM = 36, HARD = 46),
+  pendienteMinima = 0,        # pendiente minima usada en las estrategias (s/vuelta)
+  paradas = 1:2,              # cantidades de paradas a comparar
+  maxEstrategias = 3,         # estrategias distintas a mostrar
+  # VSC/SC (resultados/notas_neutralizaciones.md). NULL = no se analizan.
+  neutralizacion = list(
+    # Perdida por parada bajo VSC/SC como proporcion de la verde. Medida directa en las
+    # paradas hechas: VSC 0,57 y SC 0,50 (resultados/perdidaNeutralizada.R), pero solo
+    # incluye a quienes pararon en el momento justo. Calibrado con 280 decisiones reales
+    # en 34 episodios (resultados/calibrarFactores.R): SC 0,32 (82 % de acuerdo validado
+    # por GP); VSC 1,0, porque ninguna proporcion supera a "nunca parar" (81 %): en la
+    # practica un VSC de unas 2 vueltas no abarata la parada lo suficiente.
+    factorPerdida = c(VSC = 1.0, SC = 0.32),
+    # Tipos que se analizan. El VSC quedo afuera de los resultados (decision de Facundo,
+    # 10/11/2026): su beneficio depende de donde esta el auto cuando empieza.
+    tipos = "SC",
+    # Cuanto acercar la frecuencia del circuito a la tasa general (carreras ficticias):
+    # elegido con FastF1 2019-2026 (resultados/calibrarProbabilidadesFF1.R).
+    k = c(SC = 8, VSC = Inf),
+    duracion = c(SC = 4, VSC = 2),  # vueltas, medianas de 113 episodios
+    maxParadas = 2,
+    secciones = 10
+  ),
+  # Edad esperada de cada juego al montarlo en carrera (vueltas). Medida el 29/10/2026
+  # con 38 carreras secas que no son casos de investigacion: el 39 % de los stints de
+  # SOFT arranca con un juego usado (casi siempre 3 vueltas, de clasificacion), el 12 %
+  # de MEDIUM y el 10 % de HARD. Como el tiempo del modelo es lineal en la edad
+  # inicial, usar la media da el tiempo esperado. 0 = juegos nuevos.
+  edadInicial = c(SOFT = 1.4, MEDIUM = 0.4, HARD = 0.4),
+  # Margen de empate: residuos de la calibracion dejando fuera cada GP (mismos 37 GP).
+  # degradacion en puntos de % por vuelta; difBase en % de la base del MEDIUM.
+  incertidumbre = list(
+    simulaciones = 200, cuantil = 0.9,
+    residuos = list(
+      degradacion = list(
+        SOFT = c(0.059, -0.041, -1.138, -0.007, -0.043, 0.059, -0.026, 0.066, 0.16, 0.033,
+                 0.125, 0.006, 0.005, 0.103, 0.071, -0.08, 0.022, -0.217, 0.038, 0.049, -0.026,
+                 0.073, -0.005, 0.019),
+        MEDIUM = c(0.149, -0.077, 0.078, 0.025, 0.028, 0.042, -0.037, 0.039, 0.024, -0.057, 0.032,
+                   0.006, 0, 0.035, 0.003, 0.08, -0.031, -0.017, 0, -0.071, -0.038, 0.045, 0.212,
+                   0.039, 0.047, -0.011, 0.034, -0.006, 0.077, -0.001, 0.032, -0.039, -0.013,
+                   0.057, -0.034, 0.218, 0.03, 0.004, 0.013, -0.018, -0.062, 0.004, -0.07, 0.063,
+                   0.2),
+        HARD = c(-0.067, 0.052, -0.026, -0.086, 0.011, 0.036, -0.014, -0.031, 0.11, 0.008, 0.07,
+                 0, 0.072, 0.109, -0.018, 0.013, 0.017)),
+      difBase = list(
+        SOFT = c(0.75, -0.6, 0.88, 2.28, 0.28, -0.1, -0.04, 0.78, -0.61, -0.35, 1.76, 8.67,
+                 0.57, 0.88, -0.4, 1.9, 0.61, 0.62, -0.22, -0.54, -1.67, -0.03, -3.08, 1.26,
+                 -0.68, 0.09, -0.26, -0.51, -0.56, 0.82, 0.06, -0.57, 0.2, -0.3, -0.55, 1.16,
+                 -0.9, -1.65, 0.33, 0.1, -0.44, -0.07, 0.42, 0.38, -0.08),
+        HARD = c(0.8, -0.32, 0.55, -0.14, -0.27, 0.18, -0.08, -0.23, -0.09, 0.99, -0.18, 0.06,
+                 0.09, -0.08, 1, 0.06, 0.13, 0.25, -0.24, -0.15, -0.03, -0.39, -0.51, 0.12,
+                 0.25, 0.62, 0.59, 0.55, 0.15, -0.03, 0.28, 0.02, -0.67, 0.01, 0.01, -0.18,
+                 -0.29, 0.09, 0.02, -0.52, 0.57, -0.12, 0.45, -0.7, -0.01, -2.6, 0.38, -0.21,
+                 0.37, -0.3, -0.64, -0.02)))
   )
+)
+
+seleccionUsuario <- NULL
+modoAnalisis <- NULL
+if (interactive()) {
+  opcionModo <- elegirOpcion("Selecciona el modo", c(
+    "Investigacion: solo casos evaluables contra la carrera real",
+    "Uso: casos con practicas suficientes, sin mirar la carrera"
+  ))
+  if (opcionModo > 0) {
+    modoAnalisis <- c("investigacion", "uso")[opcionModo]
+    gpDisponibles <- gpConTramosCandidatos
+    posicionesPrevias <- NULL
+    if (modoAnalisis == "investigacion") {
+      cat("Buscando carreras secas sin bandera roja ni SC/VSC...\n")
+      estados <- sapply(gpDisponibles$meeting_key, function(m)
+        estadoCarreraEvaluable(leerCarreraGP(rutaBase, m)))
+      gpDisponibles <- gpDisponibles[estados == "ok", ]
+      posicionesPrevias <- reconstruirPosiciones(rutaBase)
+    }
+    seleccionUsuario <- seleccionarAnalisis(
+      gpDisponibles = gpDisponibles,
+      revisionClima = revisionClima,
+      rutaBase = rutaBase,
+      filtrarPilotos = function(gp, pilotos, tramos) pilotosElegiblesGP(
+        gp, pilotos, tramos, modoAnalisis, revisionClima, rutaBase, parametros,
+        posicionesPrevias)
+    )
+  }
 
   if (is.null(seleccionUsuario)) {
     cat("No se completo la seleccion.\n")
@@ -1490,7 +2289,6 @@ if (interactive()) {
     cat("Piloto:", seleccionUsuario$piloto$full_name,
         "- dorsal", seleccionUsuario$piloto$driver_number, "\n")
     cat("Practicas con tramo candidato:", nrow(seleccionUsuario$tramos), "\n")
-    cat("Siguiente paso: comprobar las vueltas y compuestos del piloto elegido.\n")
   }
 } else {
   cat("Menus omitidos en ejecucion no interactiva. Usa Source en RStudio para elegir.\n")
@@ -1503,7 +2301,8 @@ if (!is.null(seleccionUsuario)) {
   revisionPiloto <- revisarPracticasPiloto(
     seleccion = seleccionUsuario,
     revisionClima = revisionClima,
-    rutaBase = rutaBase
+    rutaBase = rutaBase,
+    combustible = combustibleGP(seleccionUsuario$granPremio, rutaBase, parametros)
   )
 
   vueltasPiloto <- revisionPiloto$vueltas
@@ -1531,4 +2330,8 @@ if (!is.null(seleccionUsuario)) {
   if (any(vueltasPiloto$estado_residuo == "no_evaluada_pocos_residuos")) {
     cat("Advertencia: hay vueltas aptas sin evaluar sus residuos por falta de datos.\n")
   }
+
+  # Modelo, estrategias y, en investigacion, comparacion con la carrera real.
+  resultadoCaso <- analizarCaso(seleccionUsuario, modoAnalisis, revisionClima,
+                                rutaBase, parametros)
 }

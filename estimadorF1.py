@@ -74,6 +74,10 @@ CONJUNTOS = {
     }),
 }
 ENDPOINTS_INICIALES = ("drivers", "weather", "laps", "stints", "pit", "race_control")
+# Una respuesta vacía se reintenta solo mientras la sesión es reciente: pasado este
+# plazo, la ausencia se toma como definitiva de la fuente (ej. boxes de 2023) y no se
+# vuelve a pedir en cada ejecución. --forzar permite reintentarla igual.
+DIAS_REINTENTO_VACIA = 7
 
 SQL_GP = """CREATE TABLE {tabla} (
     meeting_key INTEGER PRIMARY KEY, temporada INTEGER NOT NULL, nombre TEXT NOT NULL,
@@ -317,12 +321,20 @@ def _firmaSesion(sesion):
     return serializar({k: sesion[k] for k in ("fecha_inicio", "fecha_fin", "tipo", "cancelada")})
 
 
-def necesitaDescarga(conexion, endpoint, parametros, ahora, forzar=False, firma=None):
+def _vaciaDefinitiva(fin, instante):
+    fin, instante = fechaUTC(fin), fechaUTC(instante)
+    return fin is not None and instante is not None and instante - fin >= timedelta(days=DIAS_REINTENTO_VACIA)
+
+
+def necesitaDescarga(conexion, endpoint, parametros, ahora, forzar=False, firma=None, finSesion=None):
     if forzar:
         return True
     estado = conexion.execute("SELECT * FROM descargas WHERE clave=?", (_clave(endpoint, parametros),)).fetchone()
     if estado is None or estado["firma_sesion"] != firma:
         return True
+    # También cubre vacíos guardados antes de esta regla, que tienen próxima revisión.
+    if estado["estado"] == "vacia" and _vaciaDefinitiva(finSesion, estado["intento_en"]):
+        return False
     proxima = fechaUTC(estado["proxima_revision"])
     return proxima is not None and proxima <= ahora
 
@@ -456,7 +468,8 @@ def descargarYGuardar(cliente, endpoint, parametros, ahora, sesion=None):
             # Vacío, error y pendiente son situaciones diferentes. Un vacío no
             # demuestra que una práctica fuera seca o que un piloto no participó.
             if not datos:
-                proxima = obtenido + timedelta(hours=24)
+                proxima = None if sesion is not None and _vaciaDefinitiva(sesion["fecha_fin"], instante) \
+                    else obtenido + timedelta(hours=24)
             elif sesion is None:
                 proxima = obtenido if parametros["year"] == ahora.year else None
             elif (obtenido - fechaUTC(sesion["fecha_fin"])) < timedelta(days=3):
@@ -582,7 +595,7 @@ def main(argv=None):
             for sesion in sesiones:
                 endpoints = [e for e in args.endpoints if e != "intervals" or sesion["tipo"] == "Race"]
                 pendientes = [e for e in endpoints if necesitaDescarga(conexion,e,{"session_key":sesion["session_key"]},ahora,
-                                                                      args.forzar,_firmaSesion(sesion))]
+                                                                      args.forzar,_firmaSesion(sesion),sesion["fecha_fin"])]
                 if not pendientes:
                     continue
                 if args.max_sesiones is not None and procesadas >= args.max_sesiones:

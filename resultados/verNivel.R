@@ -1,0 +1,21 @@
+x <- read.csv("resultados/error_nivel.csv"); options(width = 180)
+cal <- x[!x$evaluable, ]; ev <- x[x$evaluable, ]
+cat("Calibracion: piloto-GP", nrow(cal), "en", length(unique(paste(cal$temporada, cal$gp))), "GP | Evaluables:", nrow(ev), "en", length(unique(paste(ev$temporada, ev$gp))), "\n")
+gpm <- function(d, v) aggregate(d[[v]], list(g = paste(d$temporada, d$gp), t = d$temporada), median)
+s <- gpm(cal, "desp"); p <- gpm(cal, "pct")
+cat(sprintf("Por GP, s: mediana %+.2f cuartiles %+.2f a %+.2f | %%: mediana %+.2f cuartiles %+.2f a %+.2f\n", median(s$x), quantile(s$x,.25), quantile(s$x,.75), median(p$x), quantile(p$x,.25), quantile(p$x,.75)))
+print(aggregate(cbind(seg = s$x, pct = p$x), list(temporada = s$t), median))
+cat("Por piloto: dispersion MAD", round(mad(cal$desp), 2), "s\n")
+cat("Dentro de un GP (MAD tipico):", round(median(tapply(cal$desp, paste(cal$temporada, cal$gp), mad)), 2), "s | entre GP (MAD):", round(mad(s$x), 2), "s\n")
+cal$grupo <- cut(cal$puesto_ritmo, c(0, 5, 10, 25), labels = c("1-5 ritmo", "6-10", "11+"))
+print(aggregate(cbind(desp, pct) ~ grupo, cal, median))
+k <- median(p$x); c0 <- median(s$x)
+e <- function(d, f) median(abs(d$desp - f(d)))
+cat("\nError abs mediano por piloto (s):\n")
+for (n in c("cal", "ev")) { d <- get(n)
+  cat(sprintf("%-4s sin corregir %.2f | constante s %.2f | constante %% %.2f\n", n, e(d, function(q) 0), e(d, function(q) c0), e(d, function(q) k / 100 * q$t_med))) }
+# Dejando fuera cada GP
+gs <- unique(paste(cal$temporada, cal$gp)); lo <- sapply(gs, function(g) { o <- p$x[p$g != g]; d <- cal[paste(cal$temporada, cal$gp) == g, ]; c(median(abs(d$desp)), median(abs(d$desp - median(o) / 100 * d$t_med))) })
+cat(sprintf("Dejando fuera cada GP (mediana de GP): sin corregir %.2f | con %% %.2f\n", median(lo[1,]), median(lo[2,])))
+cat(sprintf("Evaluables, nivel restante con %%: mediana %+.2f s\n", median(ev$desp - k / 100 * ev$t_med)))
+cat(sprintf("Constantes: %.2f s | %.2f %%\n", c0, k))

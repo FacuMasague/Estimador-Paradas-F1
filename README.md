@@ -111,6 +111,111 @@ guardar carreras históricas y prácticas; su presencia conjunta en SQLite no au
 mezclarlas. Guardar hoy un registro histórico tampoco demuestra que su versión
 actual ya estuviera disponible antes de aquella carrera.
 
+## Análisis en R (MVP)
+
+Abrir `Estimador de paradas F1.Rproj` en RStudio y hacer **Source** de
+`estimadorR.R`. Las fórmulas están en `modeloEstrategias.R`, que se carga solo.
+Con `Rscript estimadorR.R` se omiten los menús y no se analiza ningún caso.
+
+El programa pide primero el modo:
+
+- **Investigación:** solo carreras secas (también antes de largar), sin bandera
+  roja ni SC/VSC, y pilotos que terminaron con 1 o 2 paradas y compuestos conocidos.
+  Ordena primero a los pilotos con posición media en el top 10 en sus 5 carreras
+  anteriores (orden de llegada reconstruido desde las vueltas, sin penalizaciones).
+  Compara el resultado con la carrera real y guarda gráficos en `resultados/`.
+- **Uso:** solo exige datos suficientes de prácticas; no mira la carrera.
+
+Modelo: `t = base_c + pendiente_c · edad + combustible`.
+
+- **Combustible:** la carga de práctica no se publica; se estima la mínima de cada
+  stint (vueltas que le faltan, contando salida y entrada, más una vuelta de margen).
+  El efecto total en carrera es 3,3 s (lo que gana el auto entre la primera y la
+  última vuelta por combustible y evolución de la pista), medido con una regresión
+  en 54 GP, casos incluidos (3,1 s sin ellos; parecido en 2023–25 y 2026). Por vuelta
+  son 3,3 / vueltas de carrera.
+  Un stint de SOFT de hasta 6 vueltas se toma como simulacro de clasificación y
+  consume 1,25 veces más (estimación de baja confianza).
+- **Degradación:** porcentual, con todos los pilotos del fin de semana (cada uno
+  aporta si tiene al menos 8 vueltas aptas con 5 vueltas de rango en ese
+  compuesto; se usa la mediana y se exigen 3 pilotos).
+- **Base:** la del piloto (al menos 3 vueltas aptas propias). Si le falta SOFT o
+  HARD: su MEDIUM por la diferencia pareada con el MEDIUM de los pilotos que usaron
+  ambos (al menos 3); si no, la de su compañero; si es el HARD y no hay nada, igual
+  al MEDIUM (escenario condicionado). Sin degradación de HARD en el campo se usa la
+  del MEDIUM. El programa informa el origen de cada valor.
+
+- **Calibración práctica → carrera** (`parametros$calibracion`; medida el 10/11/2026
+  con los 54 GP secos de 2023–2026 de tres prácticas, **incluidos los casos de
+  investigación**: sus resultados quedan dentro de la muestra; la carrera sale de
+  una regresión por GP que separa combustible y degradación; scripts y datos en
+  `resultados/regresionCarrera.R`, `resultados/calibracion2.R` y
+  `resultados/calibracion2.csv`):
+  - la degradación de prácticas se multiplica por 0,44 (SOFT), 0,58 (MEDIUM) y 0,69
+    (HARD);
+  - la diferencia de base entre compuestos en prácticas no se relaciona con la de
+    carrera: SOFT y HARD salen del MEDIUM propio con la diferencia mediana de carrera
+    (−0,01 % y +0,03 %);
+  - si el campo no alcanza para la degradación del SOFT o del HARD, se usa la del
+    MEDIUM por 0,93 o 0,89 (cociente mediano en carrera).
+  - el ritmo de carrera es más rápido que el de prácticas: la base se multiplica por
+    0,9888 (−1,12 %; mediana de 50 GP de tres prácticas, casos incluidos, IC 95 %
+    −1,61 a −0,71; sin los casos, −1,01 %). Es un ajuste promedio: la causa no se
+    pudo aislar y varía mucho entre GP y pilotos (`resultados/errorNivel2.R`).
+  Con `calibracion = NULL` se usa el modelo sin calibrar descripto arriba.
+  Evaluación externa: los GP de Estados Unidos, México y Brasil 2026 no se descargaron
+  a propósito mientras se ajustaba el modelo; son los únicos GP que el modelo no vio.
+
+La pérdida por parada se estima con otras ediciones de la carrera del mismo circuito
+(entrada + salida menos dos vueltas normales), preferentemente anteriores. Se
+comparan estrategias de 1 y 2 paradas con al menos dos compuestos secos. Los
+parámetros están en la lista `parametros` de `estimadorR.R`; ninguno está validado.
+
+Edad de los juegos: el 39 % de los stints de SOFT en carrera arranca con un juego
+usado (casi siempre de 3 vueltas, de clasificación), contra 12 % de MEDIUM y 10 % de
+HARD (38 carreras secas que no son casos). Como no se descargan los stints de
+clasificación, no se sabe qué juegos le quedan a cada piloto: se usa la edad inicial
+media (1,4, 0,4 y 0,4 vueltas), que da el tiempo esperado porque el modelo es lineal
+en la edad.
+
+Margen de empate: las constantes de calibración tienen error. El programa repite la
+búsqueda 200 veces sumando residuos de la calibración elegidos al azar (degradación
+y diferencia de base, por compuesto) y toma como margen el percentil 90 de lo que
+pierde la recomendada frente a la mejor de cada simulación. Las combinaciones a menos
+de ese margen se informan como empatadas; en investigación también se informa en qué
+proporción de simulaciones la estrategia real fue más rápida que la recomendada.
+
+Gráficos de investigación: tiempos reales, predicción y recta real de cada stint
+(Theil-Sen de las vueltas limpias); diferencias de estrategias con el margen de
+empate; vueltas de práctica del piloto y rectas del modelo.
+
+Caída final y vida máxima: la caída final del neumático (el "cliff" que Pirelli diseña
+a partir de cierta distancia) no se pudo medir en 70 carreras (`resultados/caida.R`):
+los equipos paran antes. Coincide con la literatura: el simulador de Heilmeier et al.
+usa degradación lineal en sus 122 carreras ajustadas, y Cappello y Hoegh (2025) no
+encuentran mejora con degradación que se acelera. En su lugar, un juego no puede
+superar en carrera las vueltas que los equipos casi nunca superan (percentil 95 de
+3.293 stints): 31 SOFT, 36 MEDIUM y 46 HARD (`parametros$vidaMaxima`). Es una
+restricción tomada del comportamiento de los equipos, no de la física del neumático.
+
+Safety car (detalle y resultados en `resultados/notas_neutralizaciones.md`). Para la
+estrategia recomendada, el programa informa:
+- la probabilidad de al menos un SC en el circuito, con carreras secas anteriores de
+  OpenF1 (la frecuencia del circuito se acerca a la tasa general porque las diferencias
+  entre circuitos no fueron significativas con 8 temporadas de FastF1);
+- el momento típico de inicio en 5 tramos de 20 %, con todas las carreras;
+- si conviene parar o seguir ante un SC que empieza en cada vuelta, resumido en 10
+  secciones, con el compuesto siguiente y el ahorro estimado (4.º panel del gráfico);
+- la medida D: el ahorro esperado de adaptarse frente al plan fijo, dentro del simulador.
+La pérdida por parada bajo SC es 0,32 de la verde, calibrada con decisiones reales de
+pilotos (82 % de acuerdo). El VSC quedó afuera de los resultados: ninguna regla superó a
+"nunca parar", porque su beneficio depende de dónde está el auto cuando empieza.
+Gráficos de la validación: `Rscript resultados/graficosSC.R` (o Source en RStudio).
+
+"Mejor estrategia" significa menor tiempo dentro del modelo. No incluye tráfico,
+posición en pista ni neutralizaciones, y en el modelo el orden de los stints no
+cambia el tiempo.
+
 ## Actualizaciones y respuestas de la fuente
 
 - Los catálogos del año actual se revisan en cada ejecución.
@@ -119,7 +224,10 @@ actual ya estuviera disponible antes de aquella carrera.
 - Los conjuntos válidos de sesiones consolidadas se reutilizan. Un cambio en las
   fechas, tipo o cancelación de la sesión obliga a revisarlos.
 - Para sesiones terminadas hace menos de tres días, se revisan cada seis horas.
-- Respuestas vacías se identifican como `vacia` y se reconsultan en 24 horas.
+- Respuestas vacías se identifican como `vacia`. Se reconsultan cada 24 horas solo
+  durante los 7 días posteriores a la sesión; después se toman como ausencia
+  definitiva de la fuente (por ejemplo, boxes de 2023) y no se vuelven a pedir.
+  `--forzar` permite reintentarlas.
 - OpenF1 también responde HTTP 404 con `{"detail":"No results found."}` cuando
   no encuentra registros. Solo ese mensaje exacto se trata como vacío. Se guardan
   el código HTTP y su cuerpo original; otros 404 son errores. Esto no demuestra

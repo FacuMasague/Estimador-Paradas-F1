@@ -38,3 +38,16 @@ htmlcov/
 .RData
 .Ruserdata
 .Rproj.user/
+
+# Resultados del analisis en R: se versionan los scripts, las notas para el paper, las
+# tablas de resultados y los graficos de la validacion del safety car.
+# Se dejan afuera los archivos que se regeneran corriendo el programa o los scripts:
+# - graficos de cada caso (200 PNG, unos 33 MB; los genera estimadorR.R);
+# - vueltas de carrera intermedias (las arma resultados/caida.R desde la base);
+# - logs y partes de corridas en paralelo.
+resultados/*.png
+resultados/vueltas_carrera_limpias.csv
+resultados/*.log
+resultados/ff1/*.log
+resultados/parte_*.csv
+resultados/validacion_neutralizaciones_*.csv
